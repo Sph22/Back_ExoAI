@@ -1,136 +1,178 @@
-import pandas as pd
-import numpy as np
-from sklearn.impute import SimpleImputer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+import os
+from typing import Dict, List, Tuple
+
 import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
 
-# 1. Cargar los datasets de Kepler, K2 y TESS desde archivos CSV
-koi_file = "cumulative_2025.10.02_09.40.37.csv"   # Kepler KOI cumulative dataset
-k2_file = "k2pandc_2025.10.02_09.42.15.csv"       # K2 confirmed & candidate dataset
-toi_file = "TOI_2025.10.02_09.42.06.csv"          # TESS Objects of Interest dataset
+# ===== Config =====
+DATA_DIR = os.getenv("DATA_DIR", "data")
+MODEL_PATH = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
 
-print("Loading datasets...")
-# Usamos comment='#' para ignorar las filas de comentario del archivo (cabeceras descriptivas de NASA)
-koi_df = pd.read_csv(koi_file, comment='#')
-k2_df = pd.read_csv(k2_file, comment='#')
-toi_df = pd.read_csv(toi_file, comment='#')
-print(f"Kepler KOI entries: {len(koi_df)}, K2 entries: {len(k2_df)}, TESS entries: {len(toi_df)}")
+FEATURES: List[str] = [
+    "period", "duration", "depth", "radius", "insolation", "teff", "srad"
+]
 
-# 2. Filtrar K2 para tomar sólo la solución por defecto de cada objeto (default_flag == 1)
-if 'default_flag' in k2_df.columns:
-    k2_df = k2_df[k2_df['default_flag'] == 1].copy()
-    print(f"K2 entries after default_flag filter: {len(k2_df)}")
+def _latest_path(prefix: str) -> str:
+    """Devuelve data/<prefix>.csv (archivo 'latest' escrito por fetch_datasets)."""
+    path = os.path.join(DATA_DIR, f"{prefix}.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No se encontró {path}. Ejecuta primero la actualización de datasets.")
+    return path
 
-# 3. Mapear las disposiciones/etiquetas de cada dataset a un esquema unificado (CONFIRMED, CANDIDATE, FALSE POSITIVE)
-def map_koi_label(disposition):
-    # Kepler dispositions are already 'CONFIRMED', 'CANDIDATE', 'FALSE POSITIVE'
-    return disposition  # no change needed (we'll ensure consistency in capitalization though)
-    
-def map_k2_label(disposition):
-    # K2 dispositions include 'CONFIRMED', 'CANDIDATE', 'FALSE POSITIVE', and 'REFUTED'
-    if disposition == 'REFUTED' or disposition == 'FALSE POSITIVE':
-        return 'FALSE POSITIVE'
-    elif disposition == 'CONFIRMED':
-        return 'CONFIRMED'
-    elif disposition == 'CANDIDATE':
-        return 'CANDIDATE'
-    else:
-        return disposition  # unexpected cases
-    
-def map_toi_label(tfopwg_disp):
-    # TESS TFOPWG dispositions: CP, KP = confirmed, PC, APC = candidate, FP, FA = false positive
-    if tfopwg_disp in ['CP', 'KP']:
-        return 'CONFIRMED'
-    elif tfopwg_disp in ['PC', 'APC']:
-        return 'CANDIDATE'
-    elif tfopwg_disp in ['FP', 'FA']:
-        return 'FALSE POSITIVE'
-    else:
-        return tfopwg_disp  # if any other appears
-    
-koi_df['Label'] = koi_df['koi_disposition'].apply(map_koi_label)
-k2_df['Label'] = k2_df['disposition'].apply(map_k2_label)
-toi_df['Label'] = toi_df['tfopwg_disp'].apply(map_toi_label)
+def _map_labels(koi_df: pd.DataFrame, k2_df: pd.DataFrame, toi_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # Kepler KOI: koi_disposition -> ya en CONFIRMED / CANDIDATE / FALSE POSITIVE
+    koi_df = koi_df.copy()
+    if "koi_disposition" not in koi_df.columns:
+        raise KeyError("koi_disposition no existe en cumulative.csv")
+    koi_df["Label"] = koi_df["koi_disposition"].astype(str).str.upper()
 
-# 4. Seleccionar y renombrar columnas de interés en cada dataframe
-# Definimos las columnas deseadas en el conjunto final
-# Nota: K2 no tiene explicitamente duration ni depth en su tabla, colocaremos NaN luego
-koi_selected = pd.DataFrame({
-    'period': koi_df['koi_period'],
-    'duration': koi_df['koi_duration'],
-    'depth': koi_df['koi_depth'],
-    'radius': koi_df['koi_prad'],
-    'insolation': koi_df['koi_insol'],
-    'teff': koi_df['koi_steff'],
-    'srad': koi_df['koi_srad'],
-    'label': koi_df['Label']
-})
-k2_selected = pd.DataFrame({
-    'period': k2_df['pl_orbper'],
-    'duration': np.nan,                # no direct transit duration column in K2 dataset
-    'depth': np.nan,                   # no direct transit depth column in K2 dataset
-    'radius': k2_df['pl_rade'],
-    'insolation': k2_df.get('pl_insol', np.nan),  # use .get in case column missing
-    'teff': k2_df['st_teff'],
-    'srad': k2_df['st_rad'],
-    'label': k2_df['Label']
-})
-toi_selected = pd.DataFrame({
-    'period': toi_df['pl_orbper'],
-    'duration': toi_df['pl_trandurh'],
-    'depth': toi_df['pl_trandep'],
-    'radius': toi_df['pl_rade'],
-    'insolation': toi_df['pl_insol'],
-    'teff': toi_df['st_teff'],
-    'srad': toi_df['st_rad'],
-    'label': toi_df['Label']
-})
+    # K2: disposition puede incluir REFUTED
+    k2_df = k2_df.copy()
+    if "disposition" not in k2_df.columns:
+        raise KeyError("disposition no existe en k2pandc.csv")
+    def map_k2(d: str) -> str:
+        d = str(d).upper()
+        if d in ("REFUTED", "FALSE POSITIVE"):
+            return "FALSE POSITIVE"
+        if d == "CONFIRMED":
+            return "CONFIRMED"
+        if d == "CANDIDATE":
+            return "CANDIDATE"
+        return d
+    k2_df["Label"] = k2_df["disposition"].apply(map_k2)
 
-# Unimos las tres fuentes de datos
-data = pd.concat([koi_selected, k2_selected, toi_selected], ignore_index=True)
-print(f"Total combined entries: {len(data)}")
+    # TESS: tfopwg_disp -> CP,KP (confirmed); PC,APC (candidate); FP,FA (false pos)
+    toi_df = toi_df.copy()
+    if "tfopwg_disp" not in toi_df.columns:
+        raise KeyError("tfopwg_disp no existe en TOI.csv")
+    def map_toi(d: str) -> str:
+        d = str(d).upper()
+        if d in ("CP", "KP"):
+            return "CONFIRMED"
+        if d in ("PC", "APC"):
+            return "CANDIDATE"
+        if d in ("FP", "FA"):
+            return "FALSE POSITIVE"
+        return d
+    toi_df["Label"] = toi_df["tfopwg_disp"].apply(map_toi)
 
-# 5. Manejar valores faltantes en las características numéricas usando la mediana de cada columna
-features = ['period', 'duration', 'depth', 'radius', 'insolation', 'teff', 'srad']
-# Usamos SimpleImputer para rellenar NaN; entrenamos el imputer en todo el conjunto combinado
-imputer = SimpleImputer(strategy='median')
-data[features] = imputer.fit_transform(data[features])
+    return koi_df, k2_df, toi_df
 
-# 6. Separar entrenamiento y prueba
-X = data[features].values
-y = data['label'].values
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, stratify=y, random_state=42)
-print(f"Training samples: {len(X_train)}, Testing samples: {len(X_test)}")
+def _select_columns(koi_df: pd.DataFrame, k2_df: pd.DataFrame, toi_df: pd.DataFrame) -> pd.DataFrame:
+    # KOI (Kepler)
+    koi_selected = pd.DataFrame({
+        "period":     koi_df.get("koi_period"),
+        "duration":   koi_df.get("koi_duration"),
+        "depth":      koi_df.get("koi_depth"),
+        "radius":     koi_df.get("koi_prad"),
+        "insolation": koi_df.get("koi_insol"),
+        "teff":       koi_df.get("koi_steff"),
+        "srad":       koi_df.get("koi_srad"),
+        "label":      koi_df["Label"],
+    })
 
-# 7. Definir y entrenar el modelo de Random Forest
-model = RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=42)
-model.fit(X_train, y_train)
-print("Model training completed.")
+    # K2 (faltan duración y profundidad, las dejamos en NaN)
+    k2_selected = pd.DataFrame({
+        "period":     k2_df.get("pl_orbper"),
+        "duration":   np.nan,
+        "depth":      np.nan,
+        "radius":     k2_df.get("pl_rade"),
+        "insolation": k2_df.get("pl_insol"),
+        "teff":       k2_df.get("st_teff"),
+        "srad":       k2_df.get("st_rad"),
+        "label":      k2_df["Label"],
+    })
 
-# 8. Evaluar el modelo en el conjunto de prueba
-y_pred = model.predict(X_test)
-accuracy = accuracy_score(y_test, y_pred)
-print(f"Accuracy on test data: {accuracy:.4f}")
-print("Classification report:")
-print(classification_report(y_test, y_pred, digits=4))
+    # TOI (TESS)
+    toi_selected = pd.DataFrame({
+        "period":     toi_df.get("pl_orbper"),
+        "duration":   toi_df.get("pl_trandurh"),
+        "depth":      toi_df.get("pl_trandep"),
+        "radius":     toi_df.get("pl_rade"),
+        "insolation": toi_df.get("pl_insol"),
+        "teff":       toi_df.get("st_teff"),
+        "srad":       toi_df.get("st_rad"),
+        "label":      toi_df["Label"],
+    })
 
-# 9. Guardar el modelo entrenado y el imputador para futuras predicciones
-# Guardamos ambos juntos en un pipeline manual: necesitamos aplicar el imputer antes del modelo al predecir nuevos datos.
-# Una forma sencilla: empaquetar en un objeto (por ejemplo, tuple) o crear un Pipeline real de scikit-learn.
-# Aquí empaquetamos en un tuple para simplicidad.
-model_bundle = {
-    "imputer": imputer,
-    "classifier": model
-}
-joblib.dump(model_bundle, "exoplanet_model.pkl")
-print("Trained model saved to exoplanet_model.pkl")
+    data = pd.concat([koi_selected, k2_selected, toi_selected], ignore_index=True)
+    return data
 
-# 10. Ejemplo de uso del modelo entrenado con un nuevo dato (simulado)
-# Vamos a tomar un ejemplo del propio conjunto de prueba para demostrar.
-example_features = X_test[0]
-true_label = y_test[0]
-pred_label = model.predict([example_features])[0]
-print("Example candidate features:", example_features)
-print(f"True label: {true_label}  -> Model predicted: {pred_label}")
+def train() -> Dict:
+    """
+    Entrena el modelo leyendo:
+      - data/cumulative.csv
+      - data/k2pandc.csv
+      - data/TOI.csv
+    Guarda el bundle en MODEL_PATH.
+    Devuelve métricas y rutas usadas.
+    """
+    # 1) Cargar datasets “latest”
+    koi_path = _latest_path("cumulative")
+    k2_path  = _latest_path("k2pandc")
+    toi_path = _latest_path("TOI")
+
+    print("Loading datasets...")
+    koi_df = pd.read_csv(koi_path, comment="#")
+    k2_df  = pd.read_csv(k2_path,  comment="#")
+    toi_df = pd.read_csv(toi_path, comment="#")
+    print(f"Kepler KOI entries: {len(koi_df)}, K2 entries: {len(k2_df)}, TESS entries: {len(toi_df)}")
+
+    # 2) Filtro K2 default_flag == 1 (si existe)
+    if "default_flag" in k2_df.columns:
+        k2_df = k2_df[k2_df["default_flag"] == 1].copy()
+        print(f"K2 entries after default_flag filter: {len(k2_df)}")
+
+    # 3) Mapear etiquetas a un esquema común
+    koi_df, k2_df, toi_df = _map_labels(koi_df, k2_df, toi_df)
+
+    # 4) Selección y renombrado de columnas
+    data = _select_columns(koi_df, k2_df, toi_df)
+    print(f"Total combined entries: {len(data)}")
+
+    # 5) Imputación
+    features = FEATURES
+    imputer = SimpleImputer(strategy="median")
+    data[features] = imputer.fit_transform(data[features])
+
+    # 6) Split
+    X = data[features].values
+    y = data["label"].astype(str).values
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=42
+    )
+    print(f"Training samples: {len(X_train)}, Testing samples: {len(X_test)}")
+
+    # 7) Modelo
+    model = RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=42)
+    model.fit(X_train, y_train)
+    print("Model training completed.")
+
+    # 8) Métricas
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, digits=4)
+    print(f"Accuracy on test data: {accuracy:.4f}")
+    print("Classification report:\n", report)
+
+    # 9) Guardar bundle
+    model_bundle = {"imputer": imputer, "classifier": model}
+    joblib.dump(model_bundle, MODEL_PATH)
+    print(f"Trained model saved to {MODEL_PATH}")
+
+    return {
+        "data_paths": {"koi": koi_path, "k2": k2_path, "toi": toi_path},
+        "samples": {"total": int(len(data)), "train": int(len(X_train)), "test": int(len(X_test))},
+        "accuracy": float(accuracy),
+        "model_path": MODEL_PATH,
+    }
+
+if __name__ == "__main__":
+    # Entrenamiento manual local
+    out = train()
+    print(out)
