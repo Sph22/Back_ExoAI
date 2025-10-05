@@ -248,59 +248,6 @@ async def get_predictions_history(limit: int = Query(100, ge=1, le=1000)):
             detail="Google Cloud no está inicializado"
         )
     
-    local_path = gcp_utils.download_model(version=version)
-    if local_path:
-        # Recargar modelo en memoria después de descargar
-        try:
-            predict_model.reload_model()
-            return {
-                "status": "ok", 
-                "message": f"Modelo descargado y cargado en memoria: {local_path}",
-                "model_in_memory": True
-            }
-        except Exception as e:
-            return {
-                "status": "partial",
-                "message": f"Modelo descargado pero error al cargar en memoria: {local_path}",
-                "error": str(e),
-                "model_in_memory": False
-            }
-    else:
-        raise HTTPException(status_code=404, detail=f"No se encontró modelo versión '{version}'")
-
-@app.post("/cache/clear", tags=["Utils"])
-async def clear_all_caches(token: str = Query(None, description="Token de autorización")):
-    """Limpia todos los cachés de la aplicación"""
-    secret = os.getenv("TRAIN_TOKEN")
-    if secret and token != secret:
-        raise HTTPException(status_code=403, detail="Token inválido")
-    
-    try:
-        # Limpiar cachés de fetch_datasets
-        if hasattr(fetch_datasets, '_cached_read_csv'):
-            fetch_datasets._cached_read_csv.cache_clear()
-        
-        # Limpiar cachés de gcp_utils
-        gcp_utils.clear_cache()
-        
-        return {
-            "status": "ok",
-            "message": "Todos los cachés limpiados",
-            "caches_cleared": ["datasets", "gcp_storage"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ---------- local ----------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        log_level="info"
-        )
-    
     predictions = gcp_utils.get_predictions(limit=limit)
     return {"predictions": predictions, "count": len(predictions)}
 
@@ -684,3 +631,57 @@ async def download_model_from_cloud(
         raise HTTPException(
             status_code=503,
             detail="Google Cloud no está inicializado"
+        )
+    
+    local_path = gcp_utils.download_model(version=version)
+    if local_path:
+        # Recargar modelo en memoria después de descargar
+        try:
+            predict_model.reload_model()
+            return {
+                "status": "ok", 
+                "message": f"Modelo descargado y cargado en memoria: {local_path}",
+                "model_in_memory": True
+            }
+        except Exception as e:
+            return {
+                "status": "partial",
+                "message": f"Modelo descargado pero error al cargar en memoria: {local_path}",
+                "error": str(e),
+                "model_in_memory": False
+            }
+    else:
+        raise HTTPException(status_code=404, detail=f"No se encontró modelo versión '{version}'")
+
+@app.post("/cache/clear", tags=["Utils"])
+async def clear_all_caches(token: str = Query(None, description="Token de autorización")):
+    """Limpia todos los cachés de la aplicación"""
+    secret = os.getenv("TRAIN_TOKEN")
+    if secret and token != secret:
+        raise HTTPException(status_code=403, detail="Token inválido")
+    
+    try:
+        # Limpiar cachés de fetch_datasets
+        if hasattr(fetch_datasets, '_cached_read_csv'):
+            fetch_datasets._cached_read_csv.cache_clear()
+        
+        # Limpiar cachés de gcp_utils
+        gcp_utils.clear_cache()
+        
+        return {
+            "status": "ok",
+            "message": "Todos los cachés limpiados",
+            "caches_cleared": ["datasets", "gcp_storage"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- local ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        log_level="info"
+    )
