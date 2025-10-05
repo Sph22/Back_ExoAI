@@ -33,18 +33,18 @@ TAP_API = {
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+k2pandc&format=csv",
 }
 
-# Columnas “señuelo” para validar
+# Columnas esperadas (para validar que sea la tabla correcta)
 EXPECTED_COLS: Dict[str, List[str]] = {
     "cumulative": ["koi_disposition", "koi_period", "koi_prad"],
     "TOI":        ["tfopwg_disp", "pl_orbper", "pl_rade"],
     "k2pandc":    ["disposition", "pl_orbper", "pl_rade"],
 }
 
+# ---------------- utilidades ----------------
 
 def _sha256_bytes(data: bytes) -> str:
     import hashlib
     return hashlib.sha256(data).hexdigest()
-
 
 def _save_bytes(name: str, data: bytes) -> Tuple[str, str]:
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -61,7 +61,6 @@ def _save_bytes(name: str, data: bytes) -> Tuple[str, str]:
         f.write(data)
     return path, latest
 
-
 def _load_manifest() -> Dict:
     manifest_path = os.path.join(DATA_DIR, "manifest.json")
     if os.path.exists(manifest_path):
@@ -69,12 +68,10 @@ def _load_manifest() -> Dict:
             return json.load(f)
     return {"datasets": {}}
 
-
 def _save_manifest(manifest: Dict) -> None:
     manifest_path = os.path.join(DATA_DIR, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
-
 
 def _download(url: str) -> Tuple[bytes, str]:
     headers = {
@@ -90,9 +87,8 @@ def _download(url: str) -> Tuple[bytes, str]:
         raise ValueError("Respuesta vacía")
     return data, ctype
 
-
 def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
-    """Mismo lector que usamos tras descargar: engine='python', tolerante y sin low_memory."""
+    """Lector tolerante (mismo que usamos tras descargar); sin low_memory, engine python, saltando líneas malas."""
     bio = io.BytesIO(data)
     return pd.read_csv(
         bio,
@@ -101,15 +97,14 @@ def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
         on_bad_lines="skip",
     )
 
-
 def _valid_shape(df: pd.DataFrame) -> bool:
     return (df.shape[0] >= 5) and (df.shape[1] >= 5)
-
 
 def _has_expected_cols(df: pd.DataFrame, keys: List[str]) -> bool:
     cols = set(map(str, df.columns))
     return any(k in cols for k in keys)
 
+# ---------------- descarga ----------------
 
 def _fetch_one(key: str, view_url: str) -> Dict:
     attempts = []
@@ -118,7 +113,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
     data = b""
     content_type = ""
 
-    # 1) nstedAPI (TOI puede alternar nombre)
+    # 1) nstedAPI (TOI a veces alterna nombre)
     nsted_candidates = (
         [
             "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
@@ -197,7 +192,6 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         "saved": True,
     }
 
-
 def fetch_all(auto_save: bool = True) -> Dict:
     manifest = _load_manifest()
     result = {"datasets": {}, "change_detected": False}
@@ -247,42 +241,48 @@ def fetch_all(auto_save: bool = True) -> Dict:
 
     return result
 
+# --------------- PREVIEW ---------------
 
-# ---------- PREVIEW ULTRA-ROBUSTO ----------
 def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
     """
-    Reproduce la lectura que sí funcionó en la descarga: lee bytes y usa _read_csv_bytes_loose.
-    Si falla, intenta auto-detectar separador con sep=None y dtype=str.
+    Reproduce la lectura que funcionó al descargar (bytes -> _read_csv_bytes_loose).
+    Si falla, intenta: sep=None (autodetección), dtype=str, varios encodings.
+    Nunca lanza excepción hacia arriba.
     """
+    # 1) Igual que la lectura desde descarga (bytes)
     try:
         with open(path, "rb") as f:
             data = f.read()
-        df = _read_csv_bytes_loose(data)  # mismo método que funcionó al descargar
+        df = _read_csv_bytes_loose(data)
         if df is not None and df.shape[1] > 1:
             return df
     except Exception:
         pass
 
-    # Fallback: sep=None (autodetección) + dtype=str para evitar problemas de tipos
+    # 2) Fallbacks (autodetección de separador y encoding)
     for enc in ("utf-8", "utf-8-sig", "latin1"):
         try:
-            return pd.read_csv(
+            df = pd.read_csv(
                 path,
                 comment="#",
                 engine="python",
-                sep=None,           # autodetecta delimitador
-                dtype=str,          # evita inferencia problemática
+                sep=None,       # autodetecta delimitador
+                dtype=str,      # evita problemas de tipos
                 on_bad_lines="skip",
                 encoding=enc,
             )
+            if df is not None and df.shape[1] > 1:
+                return df
         except Exception:
             continue
 
     return None
 
-
 def preview(n: int = 5) -> Dict:
-    """Devuelve head(n) por dataset leyendo desde disco como si fuera la ruta de descarga (sin 500)."""
+    """
+    Devuelve head(n) por dataset leyendo desde disco con estrategias robustas.
+    Nunca lanza excepción; en caso de fallo devuelve {"error": "..."} por dataset.
+    """
     out = {"datasets": {}}
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
@@ -297,7 +297,7 @@ def preview(n: int = 5) -> Dict:
             }
             continue
 
-        # Serialización segura
+        # Serialización segura (evita NaN/np types no JSON-serializables)
         head_data = []
         for _, row in df.head(n).iterrows():
             safe_row = {}
