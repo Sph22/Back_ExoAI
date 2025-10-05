@@ -3,7 +3,7 @@ from pydantic import BaseModel, ValidationError
 import predict_model  # Importa el módulo con la lógica de predicción (predict_model.py)
 
 app = FastAPI()
-
+#hola
 # Modelo de datos de entrada utilizando Pydantic
 class InputData(BaseModel):
     period: float
