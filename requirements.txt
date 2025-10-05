@@ -1,0 +1,12 @@
+# Librerías de ciencia de datos
+pandas
+numpy
+scikit-learn
+joblib
+
+# Framework web para la API
+fastapi
+uvicorn
+
+# Validación de datos
+pydantic
