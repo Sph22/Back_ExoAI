@@ -4,7 +4,7 @@ from typing import List, Union, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, Query
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, ValidationError
 
@@ -14,9 +14,8 @@ import train_model
 
 app = FastAPI(title="ExoAI API")
 
-# ---------- util JSON-safe (profundo) ----------
+# ---------- JSON sanitize ----------
 def json_sanitize(obj: Any):
-    """Recorre dict/list/escalares y reemplaza NaN/Inf por None; convierte numpy->python."""
     if isinstance(obj, dict):
         return {str(k): json_sanitize(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -32,12 +31,10 @@ def json_sanitize(obj: Any):
             return float(obj)
         if isinstance(obj, (int, str, bool)):
             return obj
-        # pandas NA
         if pd.isna(obj):
             return None
     except Exception:
         return None
-    # fallback: str()
     return str(obj)
 
 class InputData(BaseModel):
@@ -72,11 +69,11 @@ def predict_endpoint(payload: Union[InputData, List[InputData]]):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# -------- Datasets: descarga + autoentrenamiento opcional --------
+# -------- Datasets + auto-retrain --------
 @app.get("/datasets")
 def fetch_datasets_endpoint(
-    auto_retrain: bool = Query(False, description="Si hay cambios, dispara entrenamiento en background"),
-    token: str | None = Query(None, description="Token para habilitar auto_retrain si está protegido"),
+    auto_retrain: bool = Query(False),
+    token: str | None = Query(None),
 ):
     meta = fetch_datasets.fetch_all(auto_save=True)
 
@@ -89,29 +86,24 @@ def fetch_datasets_endpoint(
                 train_model.train()
             except Exception as ex:
                 print("Entrenamiento falló:", ex)
-        try:
-            from threading import Thread
-            Thread(target=_train, daemon=True).start()
-            meta["retrain_started"] = True
-        except Exception as e:
-            meta["retrain_started"] = False
-            meta["retrain_error"] = str(e)
+        from threading import Thread
+        Thread(target=_train, daemon=True).start()
+        meta["retrain_started"] = True
     else:
         meta["retrain_started"] = False
 
     return JSONResponse(json_sanitize(meta), status_code=200)
 
-# -------- Preview seguro (sin 500 y sin NaN) --------
+# -------- Preview --------
 @app.get("/datasets/preview")
 def preview_datasets_endpoint(n: int = Query(5, ge=1, le=50)):
     try:
         data = fetch_datasets.preview(n=n)
         return JSONResponse(json_sanitize(data), status_code=200)
     except Exception as e:
-        # Nunca 500: JSON con el error (sanitizado)
         return JSONResponse(json_sanitize({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
 
-# -------- Descarga de CSV guardado (para inspección) --------
+# -------- Descargar CSV guardado --------
 @app.get("/datasets/download")
 def download_dataset(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
     path = os.path.join(os.getenv("DATA_DIR", "data"), f"{name}.csv")
@@ -119,7 +111,20 @@ def download_dataset(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$"
         return JSONResponse({"error": f"No existe {path}. Ejecuta /datasets antes."}, status_code=404)
     return FileResponse(path, filename=f"{name}.csv", media_type="text/csv")
 
-# -------- Lanzador local --------
+# -------- Entrenamiento manual --------
+@app.post("/train")
+def train_endpoint(token: str = Query(None)):
+    secret = os.getenv("TRAIN_TOKEN")
+    allow = True if not secret else (token == secret)
+    if not allow:
+        return JSONResponse({"error": "Token inválido"}, status_code=403)
+    try:
+        result = train_model.train()
+        return JSONResponse(json_sanitize(result), status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# -------- Local --------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))

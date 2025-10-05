@@ -1,0 +1,11 @@
+name: poll-datasets
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # cada 6 horas
+jobs:
+  hit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping datasets
+        run: |
+          curl -sS "https://back-exoai.onrender.com/datasets?auto_retrain=true&token=${{ secrets.TRAIN_TOKEN }}"
