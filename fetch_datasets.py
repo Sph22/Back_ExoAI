@@ -274,22 +274,60 @@ def _read_csv_robust(path: str) -> Optional[pd.DataFrame]:
 
 
 def preview(n: int = 5) -> Dict:
-    """Devuelve head(n) de cada dataset o un error por dataset. Nunca lanza excepción."""
+    """Devuelve las primeras n filas de cada dataset, siempre en formato seguro."""
     out = {"datasets": {}}
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
         if not os.path.exists(latest_path):
             out["datasets"][key] = {"error": "No existe archivo latest. Ejecuta /datasets primero."}
             continue
-        df = _read_csv_robust(latest_path)
-        if df is None:
-            out["datasets"][key] = {"error": f"No se pudo leer {latest_path}."}
-            continue
-        out["datasets"][key] = {
-            "rows": int(df.shape[0]),
-            "cols": int(df.shape[1]),
-            "columns": list(map(str, df.columns[:50])),
-            "head": df.head(n).to_dict(orient="records"),
-            "latest_path": latest_path,
-        }
+
+        try:
+            # Intentamos varias combinaciones de codificación
+            encodings = ["utf-8", "utf-8-sig", "latin1"]
+            df = None
+            for enc in encodings:
+                try:
+                    df = pd.read_csv(
+                        latest_path,
+                        comment="#",
+                        engine="python",
+                        on_bad_lines="skip",
+                        encoding=enc,
+                        low_memory=False
+                    )
+                    if len(df.columns) > 1:
+                        break
+                except Exception:
+                    continue
+
+            if df is None:
+                out["datasets"][key] = {"error": f"No se pudo leer {latest_path} con ningún encoding válido."}
+                continue
+
+            # Convertimos solo las primeras filas a tipos nativos seguros
+            preview_data = []
+            for _, row in df.head(n).iterrows():
+                safe_row = {}
+                for col, val in row.items():
+                    try:
+                        if isinstance(val, (float, int, str, type(None))):
+                            safe_row[col] = val
+                        else:
+                            safe_row[col] = str(val)
+                    except Exception:
+                        safe_row[col] = None
+                preview_data.append(safe_row)
+
+            out["datasets"][key] = {
+                "rows": int(df.shape[0]),
+                "cols": int(df.shape[1]),
+                "columns": [str(c) for c in df.columns[:50]],
+                "head": preview_data,
+                "latest_path": latest_path,
+            }
+
+        except Exception as e:
+            out["datasets"][key] = {"error": f"Excepción al procesar {latest_path}: {type(e).__name__}: {e}"}
+
     return out
