@@ -2,6 +2,7 @@ import os
 import io
 import json
 from typing import List, Dict, Tuple
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -58,7 +59,6 @@ def _read_latest_csv(name: str) -> pd.DataFrame:
 
 # ------------ mapeo de etiquetas ------------
 def map_koi_label(disposition: str) -> str:
-    # valores ya vienen como CONFIRMED / CANDIDATE / FALSE POSITIVE
     return str(disposition).upper()
 
 def map_k2_label(disposition: str) -> str:
@@ -83,6 +83,8 @@ def map_toi_label(tfopwg_disp: str) -> str:
 
 # ------------ entrenamiento principal ------------
 def train() -> Dict:
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    
     # Cargar datasets más recientes
     koi_df = _read_latest_csv("cumulative")
     toi_df = _read_latest_csv("TOI")
@@ -108,7 +110,7 @@ def train() -> Dict:
     else:
         raise ValueError("TOI.csv no contiene 'tfopwg_disp'.")
 
-    # Selección de columnas (con get para tolerar ausentes)
+    # Selección de columnas
     koi_selected = pd.DataFrame({
         "period":     koi_df.get("koi_period"),
         "duration":   koi_df.get("koi_duration"),
@@ -172,10 +174,19 @@ def train() -> Dict:
     model_bundle = {"imputer": imputer, "classifier": model, "features": features}
     joblib.dump(model_bundle, MODEL_PATH)
 
+    # Preparar métricas
+    metrics = {
+        "accuracy": acc,
+        "report": report,
+        "timestamp": timestamp,
+        "samples_total": int(len(data)),
+        "classes": sorted(list(set(y)))
+    }
+
     # Guardar métricas
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(METRICS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"accuracy": acc, "report": report}, f, indent=2)
+        json.dump(metrics, f, indent=2)
 
     return {
         "status": "ok",
@@ -184,6 +195,7 @@ def train() -> Dict:
         "accuracy": acc,
         "classes": sorted(list(set(y))),
         "metrics_path": METRICS_PATH,
+        "timestamp": timestamp
     }
 
 if __name__ == "__main__":

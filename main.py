@@ -13,23 +13,24 @@ from pydantic import BaseModel, ValidationError
 import fetch_datasets
 import predict_model
 import train_model
+import gcp_utils  # NUEVO: reemplaza firebase_utils
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = FastAPI(
     title="ExoAI API",
-    version="1.0.2",
-    description="API para predicción de exoplanetas con ML"
+    version="1.0.4",
+    description="API para predicción de exoplanetas con ML + Google Cloud"
 )
 
 # ========== CONFIGURACIÓN DE CORS ==========
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción, especifica dominios: ["https://tu-frontend.com"]
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Permite GET, POST, PUT, DELETE, etc.
-    allow_headers=["*"],  # Permite todos los headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------- util: sanitizar NaN/Inf para JSON ----------
@@ -71,12 +72,23 @@ def on_startup():
     print("🚀 Iniciando ExoAI API...")
     os.makedirs(DATA_DIR, exist_ok=True)
     
+    # Inicializar Google Cloud
+    gcp_initialized = gcp_utils.init_gcp()
+    
     # Verificar si existe el modelo
     model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
     if os.path.exists(model_path):
-        print(f"✅ Modelo encontrado en {model_path}")
+        print(f"✅ Modelo local encontrado en {model_path}")
     else:
-        print(f"⚠️  Modelo NO encontrado en {model_path}. Ejecuta /train primero.")
+        print(f"⚠️ Modelo local NO encontrado en {model_path}")
+        # Intentar descargar desde GCP
+        if gcp_initialized:
+            print("🔄 Intentando descargar modelo desde Google Cloud...")
+            downloaded = gcp_utils.download_model()
+            if downloaded:
+                print(f"✅ Modelo descargado desde GCP")
+            else:
+                print("❌ No se pudo descargar modelo desde GCP")
     
     # Listar rutas disponibles
     rutas = []
@@ -85,7 +97,7 @@ def on_startup():
             methods = list(getattr(rt, 'methods', []))
             rutas.append(f"{' '.join(methods):6} {rt.path}")
     
-    print("\n📍 RUTAS DISPONIBLES:")
+    print("\n📋 RUTAS DISPONIBLES:")
     for ruta in sorted(rutas):
         print(f"   {ruta}")
     print()
@@ -105,7 +117,9 @@ def root():
             "datasets": "/datasets",
             "preview": "/datasets/preview?n=5",
             "train": "/train",
-            "predict": "/predict"
+            "predict": "/predict",
+            "predictions_history": "/predictions/history",
+            "cloud_storage": "/cloud/storage/list"
         }
     }
 
@@ -119,7 +133,8 @@ def health_check():
         "status": "healthy",
         "model_ready": model_exists,
         "data_available": data_exists,
-        "data_dir": DATA_DIR
+        "data_dir": DATA_DIR,
+        "gcp_enabled": gcp_utils.is_initialized()
     }
 
 @app.get("/routes", tags=["Info"])
@@ -139,11 +154,15 @@ def list_routes():
 
 # ---------- predicción ----------
 @app.post("/predict", tags=["ML"])
-async def predict_endpoint(payload: Union[InputData, List[InputData]]):
+async def predict_endpoint(
+    payload: Union[InputData, List[InputData]],
+    save_to_cloud: bool = Query(False, description="Guardar predicción en Firestore")
+):
     """
     Predice si un objeto es un exoplaneta confirmado
     
     - **payload**: Datos del objeto (individual o lista)
+    - **save_to_cloud**: Guardar resultado en Firestore (GCP)
     
     Ejemplo de payload:
     ```json
@@ -157,6 +176,19 @@ async def predict_endpoint(payload: Union[InputData, List[InputData]]):
         "srad": 1.1
     }
     ```
+    
+    Respuesta:
+    ```json
+    {
+        "prediction": "CANDIDATE",
+        "confidence_percentage": 87.45,
+        "probabilities": {
+            "CANDIDATE": 87.45,
+            "CONFIRMED": 8.32,
+            "FALSE POSITIVE": 4.23
+        }
+    }
+    ```
     """
     try:
         if isinstance(payload, list):
@@ -166,7 +198,14 @@ async def predict_endpoint(payload: Union[InputData, List[InputData]]):
         else:
             data = payload.model_dump()
             pred = predict_model.predict_one(data)
-            return {"prediction": pred}
+            
+            # Guardar en Firestore si está habilitado
+            if save_to_cloud and gcp_utils.is_initialized():
+                doc_id = gcp_utils.save_prediction(data, pred)
+                if doc_id:
+                    pred["firestore_id"] = doc_id
+            
+            return pred
     except ValidationError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except FileNotFoundError as fe:
@@ -176,6 +215,18 @@ async def predict_endpoint(payload: Union[InputData, List[InputData]]):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/predictions/history", tags=["ML"])
+async def get_predictions_history(limit: int = Query(100, ge=1, le=1000)):
+    """Obtiene historial de predicciones desde Firestore"""
+    if not gcp_utils.is_initialized():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Cloud no está inicializado"
+        )
+    
+    predictions = gcp_utils.get_predictions(limit=limit)
+    return {"predictions": predictions, "count": len(predictions)}
 
 @app.get("/predict/test", tags=["ML"])
 async def predict_test():
@@ -189,7 +240,6 @@ async def predict_test():
                 "solution": "Ejecuta POST /train primero"
             }
         
-        # Hacer una predicción de prueba
         test_data = {
             "period": 3.52,
             "duration": 2.8,
@@ -228,6 +278,13 @@ def datasets(
     try:
         meta = fetch_datasets.fetch_all(auto_save=True)
         
+        # Subir datasets a Google Cloud Storage
+        if gcp_utils.is_initialized():
+            for key in ["cumulative", "TOI", "k2pandc"]:
+                path = os.path.join(DATA_DIR, f"{key}.csv")
+                if os.path.exists(path):
+                    gcp_utils.upload_dataset(path, key)
+        
         # Autorización de retrain
         secret = os.getenv("TRAIN_TOKEN")
         allowed = True if not secret else (token == secret)
@@ -236,11 +293,19 @@ def datasets(
             from threading import Thread
             def _bg():
                 try:
-                    print("🔄 Iniciando entrenamiento automático...")
-                    train_model.train()
-                    print("✅ Entrenamiento completado")
+                    print("Iniciando entrenamiento automático...")
+                    train_result = train_model.train()
+                    
+                    # Subir modelo y métricas a GCP
+                    if gcp_utils.is_initialized():
+                        model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
+                        version = train_result.get("timestamp", "auto")
+                        gcp_utils.upload_model(model_path, version=version)
+                        gcp_utils.save_training_metrics(train_result)
+                    
+                    print("Entrenamiento completado")
                 except Exception as e:
-                    print(f"❌ Entrenamiento falló: {e}")
+                    print(f"Entrenamiento falló: {e}")
             Thread(target=_bg, daemon=True).start()
             meta["retrain_started"] = True
         else:
@@ -265,7 +330,6 @@ def datasets_preview(n: int = Query(5, ge=1, le=50, description="Número de fila
     - **n**: Número de filas (entre 1 y 50)
     """
     try:
-        # Verificar si existen los archivos
         missing_files = []
         for key in ["cumulative", "TOI", "k2pandc"]:
             path = os.path.join(DATA_DIR, f"{key}.csv")
@@ -321,21 +385,19 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
     """
     secret = os.getenv("TRAIN_TOKEN")
     
-    # Validar token solo si está configurado
     if secret:
         if not token:
             raise HTTPException(
                 status_code=403, 
-                detail=f"Token requerido. TRAIN_TOKEN está configurado."
+                detail="Token requerido. TRAIN_TOKEN está configurado."
             )
         if token != secret:
             raise HTTPException(
                 status_code=403, 
-                detail=f"Token inválido. Recibido: '{token[:5]}...'"
+                detail="Token inválido"
             )
     
     try:
-        # Verificar que existan los datos
         cumulative_path = os.path.join(DATA_DIR, "cumulative.csv")
         if not os.path.exists(cumulative_path):
             raise HTTPException(
@@ -343,10 +405,19 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
                 detail="No hay datos para entrenar. Ejecuta GET /datasets primero."
             )
         
-        print(f"🎯 Iniciando entrenamiento con datos desde: {cumulative_path}")
+        print(f"Iniciando entrenamiento con datos desde: {cumulative_path}")
         out = train_model.train()
-        print(f"✅ Entrenamiento completado: {out}")
         
+        # Subir modelo y métricas a GCP
+        if gcp_utils.is_initialized():
+            model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
+            version = out.get("timestamp", "manual")
+            model_url = gcp_utils.upload_model(model_path, version=version)
+            gcp_utils.save_training_metrics(out)
+            if model_url:
+                out["gcp_model_path"] = model_url
+        
+        print(f"Entrenamiento completado: {out}")
         return JSONResponse(js(out), status_code=200)
     
     except HTTPException:
@@ -358,7 +429,7 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
             "type": type(e).__name__,
             "traceback": traceback.format_exc()
         }
-        print(f"❌ Error en /train: {error_detail}")
+        print(f"Error en /train: {error_detail}")
         raise HTTPException(
             status_code=500,
             detail=error_detail
@@ -380,10 +451,10 @@ async def train_status():
         "model_path": model_path if model_exists else None,
         "ready_to_train": data_exists,
         "can_predict": model_exists,
-        "train_token_required": os.getenv("TRAIN_TOKEN") is not None
+        "train_token_required": os.getenv("TRAIN_TOKEN") is not None,
+        "gcp_enabled": gcp_utils.is_initialized()
     }
     
-    # Si hay datos, verificar contenido
     if data_exists:
         try:
             import pandas as pd
@@ -396,6 +467,10 @@ async def train_status():
         except Exception as e:
             status["data_read_error"] = str(e)
     
+    # Listar modelos en GCP Storage
+    if gcp_utils.is_initialized():
+        status["gcp_model_versions"] = gcp_utils.list_model_versions()
+    
     if not data_exists:
         status["message"] = "Ejecuta GET /datasets para descargar los datos primero"
     elif not model_exists:
@@ -404,6 +479,65 @@ async def train_status():
         status["message"] = "Todo listo. Puedes hacer predicciones en POST /predict"
     
     return status
+
+@app.get("/train/history", tags=["ML"])
+async def training_history(limit: int = Query(50, ge=1, le=200)):
+    """Obtiene historial de entrenamientos desde Firestore"""
+    if not gcp_utils.is_initialized():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Cloud no está inicializado"
+        )
+    
+    history = gcp_utils.get_training_history(limit=limit)
+    return {"history": history, "count": len(history)}
+
+# ---------- endpoints de Cloud Storage ----------
+@app.get("/cloud/storage/list", tags=["Cloud"])
+async def list_cloud_files(prefix: str = Query("", description="Prefijo para filtrar archivos")):
+    """Lista archivos en Google Cloud Storage"""
+    if not gcp_utils.is_initialized():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Cloud no está inicializado"
+        )
+    
+    files = gcp_utils.list_files(prefix=prefix)
+    return {"files": files, "count": len(files)}
+
+@app.get("/cloud/models/versions", tags=["Cloud"])
+async def list_model_versions():
+    """Lista versiones de modelos disponibles en GCP"""
+    if not gcp_utils.is_initialized():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Cloud no está inicializado"
+        )
+    
+    versions = gcp_utils.list_model_versions()
+    return {"versions": versions, "count": len(versions)}
+
+@app.post("/cloud/models/download", tags=["Cloud"])
+async def download_model_from_cloud(
+    version: str = Query("latest", description="Versión a descargar"),
+    token: str = Query(None, description="Token de autorización")
+):
+    """Descarga un modelo específico desde GCP"""
+    secret = os.getenv("TRAIN_TOKEN")
+    if secret and token != secret:
+        raise HTTPException(status_code=403, detail="Token inválido")
+    
+    if not gcp_utils.is_initialized():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Cloud no está inicializado"
+        )
+    
+    local_path = gcp_utils.download_model(version=version)
+    if local_path:
+        return {"status": "ok", "message": f"Modelo descargado: {local_path}"}
+    else:
+        raise HTTPException(status_code=404, detail=f"No se encontró modelo versión '{version}'")
 
 # ---------- local ----------
 if __name__ == "__main__":

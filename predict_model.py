@@ -19,7 +19,21 @@ def _load_bundle():
 def _ensure_order(x: Dict[str, float], features: List[str]) -> List[float]:
     return [float(x.get(f, np.nan)) for f in features]
 
-def predict_one(payload: Dict[str, float]) -> Union[int, float, str]:
+def predict_one(payload: Dict[str, float]) -> Dict[str, Union[str, float, Dict]]:
+    """
+    Realiza una predicción y retorna la clase, confianza y probabilidades
+    
+    Returns:
+        {
+            "prediction": "CANDIDATE",
+            "confidence_percentage": 87.45,
+            "probabilities": {
+                "CANDIDATE": 87.45,
+                "CONFIRMED": 8.32,
+                "FALSE POSITIVE": 4.23
+            }
+        }
+    """
     bundle = _load_bundle()
     imputer = bundle["imputer"]
     clf = bundle["classifier"]
@@ -27,10 +41,36 @@ def predict_one(payload: Dict[str, float]) -> Union[int, float, str]:
 
     X = np.array([_ensure_order(payload, features)], dtype=float)
     X = imputer.transform(X)
-    y_hat = clf.predict(X)
-    return y_hat.item() if hasattr(y_hat, "item") else y_hat[0]
+    
+    # Predicción
+    y_hat = clf.predict(X)[0]
+    
+    # Probabilidades
+    y_proba = clf.predict_proba(X)[0]
+    
+    # Encontrar índice de la clase predicha
+    class_idx = list(clf.classes_).index(y_hat)
+    confidence = float(y_proba[class_idx]) * 100
+    
+    # Construir diccionario de probabilidades
+    probabilities = {
+        str(cls): round(float(prob) * 100, 2) 
+        for cls, prob in zip(clf.classes_, y_proba)
+    }
+    
+    return {
+        "prediction": str(y_hat),
+        "confidence_percentage": round(confidence, 2),
+        "probabilities": probabilities
+    }
 
-def predict_batch(payload: List[Dict[str, float]]) -> List[Union[int, float, str]]:
+def predict_batch(payload: List[Dict[str, float]]) -> List[Dict[str, Union[str, float, Dict]]]:
+    """
+    Realiza predicciones en batch
+    
+    Returns:
+        Lista de diccionarios con predicciones y probabilidades
+    """
     bundle = _load_bundle()
     imputer = bundle["imputer"]
     clf = bundle["classifier"]
@@ -38,5 +78,25 @@ def predict_batch(payload: List[Dict[str, float]]) -> List[Union[int, float, str
 
     X = np.array([_ensure_order(row, features) for row in payload], dtype=float)
     X = imputer.transform(X)
-    preds = clf.predict(X)
-    return [p.item() if hasattr(p, "item") else p for p in preds]
+    
+    # Predicciones y probabilidades
+    predictions = clf.predict(X)
+    probabilities = clf.predict_proba(X)
+    
+    results = []
+    for y_hat, y_proba in zip(predictions, probabilities):
+        class_idx = list(clf.classes_).index(y_hat)
+        confidence = float(y_proba[class_idx]) * 100
+        
+        probs_dict = {
+            str(cls): round(float(prob) * 100, 2) 
+            for cls, prob in zip(clf.classes_, y_proba)
+        }
+        
+        results.append({
+            "prediction": str(y_hat),
+            "confidence_percentage": round(confidence, 2),
+            "probabilities": probs_dict
+        })
+    
+    return results
