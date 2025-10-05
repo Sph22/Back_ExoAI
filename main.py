@@ -4,15 +4,12 @@ from typing import List, Union, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 
 # ===== módulos locales =====
-# Debes tener estos archivos en la raíz del repo:
-#   - fetch_datasets.py  (funciones: fetch_all(), preview())
-#   - predict_model.py   (funciones: predict_one(), predict_batch())
-#   - train_model.py     (función: train())
 import fetch_datasets
 import predict_model
 import train_model
@@ -20,7 +17,20 @@ import train_model
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-app = FastAPI(title="ExoAI API", version="1.0.1")
+app = FastAPI(
+    title="ExoAI API",
+    version="1.0.2",
+    description="API para predicción de exoplanetas con ML"
+)
+
+# ========== CONFIGURACIÓN DE CORS ==========
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, especifica dominios: ["https://tu-frontend.com"]
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite GET, POST, PUT, DELETE, etc.
+    allow_headers=["*"],  # Permite todos los headers
+)
 
 # ---------- util: sanitizar NaN/Inf para JSON ----------
 def js(obj: Any):
@@ -58,24 +68,63 @@ class InputData(BaseModel):
 # ---------- hooks de arranque ----------
 @app.on_event("startup")
 def on_startup():
-    # imprime rutas al arrancar (útil en Render Logs)
+    print("🚀 Iniciando ExoAI API...")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    
+    # Verificar si existe el modelo
+    model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
+    if os.path.exists(model_path):
+        print(f"✅ Modelo encontrado en {model_path}")
+    else:
+        print(f"⚠️  Modelo NO encontrado en {model_path}. Ejecuta /train primero.")
+    
+    # Listar rutas disponibles
     rutas = []
     for rt in app.router.routes:
-        try:
-            rutas.append(rt.path)
-        except Exception:
-            pass
-    print("🤖 RUTAS CARGADAS:", rutas)
-    # asegura carpeta de datos
-    os.makedirs(DATA_DIR, exist_ok=True)
+        if hasattr(rt, 'path'):
+            methods = list(getattr(rt, 'methods', []))
+            rutas.append(f"{' '.join(methods):6} {rt.path}")
+    
+    print("\n📍 RUTAS DISPONIBLES:")
+    for ruta in sorted(rutas):
+        print(f"   {ruta}")
+    print()
 
 # ---------- info básica ----------
-@app.get("/")
+@app.get("/", tags=["Info"])
 def root():
-    return {"status": "ok", "version": app.version}
+    """Endpoint raíz - información básica de la API"""
+    return {
+        "status": "ok",
+        "version": app.version,
+        "title": app.title,
+        "endpoints": {
+            "docs": "/docs",
+            "routes": "/routes",
+            "health": "/health",
+            "datasets": "/datasets",
+            "preview": "/datasets/preview?n=5",
+            "train": "/train",
+            "predict": "/predict"
+        }
+    }
 
-@app.get("/routes")
+@app.get("/health", tags=["Info"])
+def health_check():
+    """Health check para monitoreo"""
+    model_exists = os.path.exists(os.getenv("MODEL_PATH", "exoplanet_model.pkl"))
+    data_exists = os.path.exists(os.path.join(DATA_DIR, "cumulative.csv"))
+    
+    return {
+        "status": "healthy",
+        "model_ready": model_exists,
+        "data_available": data_exists,
+        "data_dir": DATA_DIR
+    }
+
+@app.get("/routes", tags=["Info"])
 def list_routes():
+    """Lista todas las rutas disponibles en la API"""
     info = []
     for rt in app.router.routes:
         try:
@@ -89,79 +138,166 @@ def list_routes():
     return {"routes": info}
 
 # ---------- predicción ----------
-@app.post("/predict")
+@app.post("/predict", tags=["ML"])
 def predict_endpoint(payload: Union[InputData, List[InputData]]):
+    """
+    Predice si un objeto es un exoplaneta confirmado
+    
+    - **payload**: Datos del objeto (individual o lista)
+    """
     try:
         if isinstance(payload, list):
             data = [p.model_dump() for p in payload]
             preds = predict_model.predict_batch(data)
-            return {"predictions": preds}
+            return {"predictions": preds, "count": len(preds)}
         else:
             data = payload.model_dump()
             pred = predict_model.predict_one(data)
             return {"prediction": pred}
     except ValidationError as ve:
-        return JSONResponse({"error": str(ve)}, status_code=400)
+        raise HTTPException(status_code=400, detail=str(ve))
     except FileNotFoundError as fe:
-        return JSONResponse({"error": f"Modelo no encontrado: {fe}"}, status_code=404)
+        raise HTTPException(
+            status_code=404,
+            detail=f"Modelo no encontrado. Ejecuta POST /train primero. Error: {fe}"
+        )
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ---------- datasets: descarga/actualización ----------
-@app.get("/datasets")
-def datasets(auto_retrain: bool = Query(False),
-             token: str | None = Query(None, description="token para autorizar auto_retrain")):
-    meta = fetch_datasets.fetch_all(auto_save=True)
-
-    # Autorización de retrain
-    secret = os.getenv("TRAIN_TOKEN")
-    allowed = True if not secret else (token == secret)
-
-    if auto_retrain and meta.get("change_detected") and allowed:
-        from threading import Thread
-        def _bg():
-            try:
-                train_model.train()
-            except Exception as e:
-                print("Entrenamiento falló:", e)
-        Thread(target=_bg, daemon=True).start()
-        meta["retrain_started"] = True
-    else:
-        meta["retrain_started"] = False
-
-    return JSONResponse(js(meta), status_code=200)
+@app.get("/datasets", tags=["Data"])
+def datasets(
+    auto_retrain: bool = Query(False, description="Entrena automáticamente si hay cambios"),
+    token: str | None = Query(None, description="Token para autorizar auto_retrain")
+):
+    """
+    Descarga y actualiza los datasets de NASA Exoplanet Archive
+    
+    - **auto_retrain**: Si True y hay cambios, entrena el modelo automáticamente
+    - **token**: Requerido si TRAIN_TOKEN está configurado
+    """
+    try:
+        meta = fetch_datasets.fetch_all(auto_save=True)
+        
+        # Autorización de retrain
+        secret = os.getenv("TRAIN_TOKEN")
+        allowed = True if not secret else (token == secret)
+        
+        if auto_retrain and meta.get("change_detected") and allowed:
+            from threading import Thread
+            def _bg():
+                try:
+                    print("🔄 Iniciando entrenamiento automático...")
+                    train_model.train()
+                    print("✅ Entrenamiento completado")
+                except Exception as e:
+                    print(f"❌ Entrenamiento falló: {e}")
+            Thread(target=_bg, daemon=True).start()
+            meta["retrain_started"] = True
+        else:
+            meta["retrain_started"] = False
+            if auto_retrain and not allowed:
+                meta["retrain_denied"] = "Token inválido o no proporcionado"
+        
+        return JSONResponse(js(meta), status_code=200)
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al obtener datasets: {str(e)}"
+        )
 
 # ---------- preview de CSVs guardados ----------
-@app.get("/datasets/preview")
-def datasets_preview(n: int = Query(5, ge=1, le=50)):
+@app.get("/datasets/preview", tags=["Data"])
+def datasets_preview(n: int = Query(5, ge=1, le=50, description="Número de filas a mostrar")):
+    """
+    Muestra las primeras N filas de cada dataset guardado
+    
+    - **n**: Número de filas (entre 1 y 50)
+    """
     try:
+        # Verificar si existen los archivos
+        missing_files = []
+        for key in ["cumulative", "TOI", "k2pandc"]:
+            path = os.path.join(DATA_DIR, f"{key}.csv")
+            if not os.path.exists(path):
+                missing_files.append(key)
+        
+        if missing_files:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "Archivos no encontrados",
+                    "missing": missing_files,
+                    "solution": "Ejecuta GET /datasets primero para descargar los datos"
+                }
+            )
+        
         data = fetch_datasets.preview(n=n)
         return JSONResponse(js(data), status_code=200)
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        # devolvemos 200 para que Postman no marque error mientras depuramos
-        return JSONResponse(js({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al leer preview: {type(e).__name__}: {str(e)}"
+        )
 
 # ---------- descargar un CSV ----------
-@app.get("/datasets/download")
+@app.get("/datasets/download", tags=["Data"])
 def download(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
+    """
+    Descarga un dataset específico en formato CSV
+    
+    - **name**: Nombre del dataset (cumulative, TOI, o k2pandc)
+    """
     path = os.path.join(DATA_DIR, f"{name}.csv")
     if not os.path.exists(path):
-        return JSONResponse({"error": f"No existe {path}. Ejecuta /datasets primero."}, status_code=404)
+        raise HTTPException(
+            status_code=404,
+            detail=f"No existe {name}.csv. Ejecuta GET /datasets primero."
+        )
     return FileResponse(path, filename=f"{name}.csv", media_type="text/csv")
 
 # ---------- entrenamiento manual ----------
-@app.post("/train")
-def train(token: str = Query(None)):
+@app.post("/train", tags=["ML"])
+def train(token: str = Query(None, description="Token de autorización")):
+    """
+    Entrena el modelo de ML con los datos disponibles
+    
+    - **token**: Requerido si TRAIN_TOKEN está configurado como variable de entorno
+    """
     secret = os.getenv("TRAIN_TOKEN")
     if secret and token != secret:
-        return JSONResponse({"error": "Token inválido"}, status_code=403)
+        raise HTTPException(status_code=403, detail="Token inválido")
+    
     try:
+        # Verificar que existan los datos
+        cumulative_path = os.path.join(DATA_DIR, "cumulative.csv")
+        if not os.path.exists(cumulative_path):
+            raise HTTPException(
+                status_code=400,
+                detail="No hay datos para entrenar. Ejecuta GET /datasets primero."
+            )
+        
         out = train_model.train()
         return JSONResponse(js(out), status_code=200)
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error durante el entrenamiento: {str(e)}"
+        )
 
 # ---------- local ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        log_level="info"
+    )
