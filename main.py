@@ -13,15 +13,15 @@ from pydantic import BaseModel, ValidationError
 import fetch_datasets
 import predict_model
 import train_model
-import gcp_utils  # NUEVO: reemplaza firebase_utils
+import gcp_utils
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = FastAPI(
     title="ExoAI API",
-    version="1.0.4",
-    description="API para predicción de exoplanetas con ML + Google Cloud"
+    version="1.1.0",
+    description="API para predicción de exoplanetas con ML + Google Cloud (Optimizado)"
 )
 
 # ========== CONFIGURACIÓN DE CORS ==========
@@ -69,24 +69,35 @@ class InputData(BaseModel):
 # ---------- hooks de arranque ----------
 @app.on_event("startup")
 def on_startup():
-    print("🚀 Iniciando ExoAI API...")
+    print("🚀 Iniciando ExoAI API (Optimizado)...")
     os.makedirs(DATA_DIR, exist_ok=True)
     
     # Inicializar Google Cloud
     gcp_initialized = gcp_utils.init_gcp()
     
-    # Verificar si existe el modelo
+    # Pre-cargar el modelo en memoria
     model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
     if os.path.exists(model_path):
         print(f"✅ Modelo local encontrado en {model_path}")
+        try:
+            # Pre-carga del modelo para evitar delay en primera predicción
+            predict_model.load_bundle()
+            print("✅ Modelo pre-cargado en memoria")
+        except Exception as e:
+            print(f"⚠️ Error pre-cargando modelo: {e}")
     else:
         print(f"⚠️ Modelo local NO encontrado en {model_path}")
         # Intentar descargar desde GCP
         if gcp_initialized:
-            print("🔄 Intentando descargar modelo desde Google Cloud...")
+            print("📄 Intentando descargar modelo desde Google Cloud...")
             downloaded = gcp_utils.download_model()
             if downloaded:
                 print(f"✅ Modelo descargado desde GCP")
+                try:
+                    predict_model.load_bundle()
+                    print("✅ Modelo cargado en memoria")
+                except Exception as e:
+                    print(f"⚠️ Error cargando modelo: {e}")
             else:
                 print("❌ No se pudo descargar modelo desde GCP")
     
@@ -110,12 +121,20 @@ def root():
         "status": "ok",
         "version": app.version,
         "title": app.title,
+        "optimizations": [
+            "Modelo cargado en memoria (no se recarga en cada request)",
+            "Caché de datasets con LRU cache",
+            "Timeout reducido de 90s a 30s",
+            "Conexiones HTTP reutilizables",
+            "Nuevo endpoint /datasets/first para primeros registros con nombres"
+        ],
         "endpoints": {
             "docs": "/docs",
             "routes": "/routes",
             "health": "/health",
             "datasets": "/datasets",
             "preview": "/datasets/preview?n=5",
+            "first_records": "/datasets/first?n=3",
             "train": "/train",
             "predict": "/predict",
             "predictions_history": "/predictions/history",
@@ -129,9 +148,13 @@ def health_check():
     model_exists = os.path.exists(os.getenv("MODEL_PATH", "exoplanet_model.pkl"))
     data_exists = os.path.exists(os.path.join(DATA_DIR, "cumulative.csv"))
     
+    # Verificar si el modelo está cargado en memoria
+    model_in_memory = predict_model._model_bundle is not None
+    
     return {
         "status": "healthy",
         "model_ready": model_exists,
+        "model_in_memory": model_in_memory,
         "data_available": data_exists,
         "data_dir": DATA_DIR,
         "gcp_enabled": gcp_utils.is_initialized()
@@ -225,6 +248,59 @@ async def get_predictions_history(limit: int = Query(100, ge=1, le=1000)):
             detail="Google Cloud no está inicializado"
         )
     
+    local_path = gcp_utils.download_model(version=version)
+    if local_path:
+        # Recargar modelo en memoria después de descargar
+        try:
+            predict_model.reload_model()
+            return {
+                "status": "ok", 
+                "message": f"Modelo descargado y cargado en memoria: {local_path}",
+                "model_in_memory": True
+            }
+        except Exception as e:
+            return {
+                "status": "partial",
+                "message": f"Modelo descargado pero error al cargar en memoria: {local_path}",
+                "error": str(e),
+                "model_in_memory": False
+            }
+    else:
+        raise HTTPException(status_code=404, detail=f"No se encontró modelo versión '{version}'")
+
+@app.post("/cache/clear", tags=["Utils"])
+async def clear_all_caches(token: str = Query(None, description="Token de autorización")):
+    """Limpia todos los cachés de la aplicación"""
+    secret = os.getenv("TRAIN_TOKEN")
+    if secret and token != secret:
+        raise HTTPException(status_code=403, detail="Token inválido")
+    
+    try:
+        # Limpiar cachés de fetch_datasets
+        if hasattr(fetch_datasets, '_cached_read_csv'):
+            fetch_datasets._cached_read_csv.cache_clear()
+        
+        # Limpiar cachés de gcp_utils
+        gcp_utils.clear_cache()
+        
+        return {
+            "status": "ok",
+            "message": "Todos los cachés limpiados",
+            "caches_cleared": ["datasets", "gcp_storage"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- local ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        log_level="info"
+        )
+    
     predictions = gcp_utils.get_predictions(limit=limit)
     return {"predictions": predictions, "count": len(predictions)}
 
@@ -254,6 +330,7 @@ async def predict_test():
         return {
             "status": "ok",
             "model_loaded": True,
+            "model_in_memory": predict_model._model_bundle is not None,
             "test_prediction": pred,
             "test_data": test_data
         }
@@ -295,6 +372,9 @@ def datasets(
                 try:
                     print("Iniciando entrenamiento automático...")
                     train_result = train_model.train()
+                    
+                    # Recargar modelo en memoria
+                    predict_model.reload_model()
                     
                     # Subir modelo y métricas a GCP
                     if gcp_utils.is_initialized():
@@ -357,6 +437,66 @@ def datasets_preview(n: int = Query(5, ge=1, le=50, description="Número de fila
             detail=f"Error al leer preview: {type(e).__name__}: {str(e)}"
         )
 
+# ---------- NUEVO: primeros N registros con nombres ----------
+@app.get("/datasets/first", tags=["Data"])
+def get_first_records(n: int = Query(3, ge=1, le=100, description="Número de registros")):
+    """
+    Obtiene los primeros N registros del dataset cumulative incluyendo nombres de exoplanetas
+    
+    - **n**: Número de registros a obtener (entre 1 y 100)
+    
+    Retorna los datos necesarios para hacer predicciones más el nombre del exoplaneta si está disponible.
+    
+    Ejemplo de respuesta:
+    ```json
+    {
+        "count": 3,
+        "dataset": "cumulative",
+        "name_column_used": "kepler_name",
+        "records": [
+            {
+                "koi_period": 3.52,
+                "koi_duration": 2.8,
+                "koi_depth": 4500,
+                "koi_prad": 2.5,
+                "koi_insol": 150,
+                "koi_steff": 5800,
+                "koi_srad": 1.1,
+                "koi_disposition": "CANDIDATE",
+                "exoplanet_name": "Kepler-1b",
+                "row_index": 0
+            }
+        ]
+    }
+    ```
+    """
+    try:
+        # Verificar que existe el archivo
+        cumulative_path = os.path.join(DATA_DIR, "cumulative.csv")
+        if not os.path.exists(cumulative_path):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "Dataset cumulative no encontrado",
+                    "solution": "Ejecuta GET /datasets primero para descargar los datos"
+                }
+            )
+        
+        result = fetch_datasets.get_first_n_with_names(n=n)
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result)
+        
+        return JSONResponse(js(result), status_code=200)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al obtener registros: {type(e).__name__}: {str(e)}"
+        )
+
 # ---------- descargar un CSV ----------
 @app.get("/datasets/download", tags=["Data"])
 def download(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
@@ -382,6 +522,7 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
     - **token**: Requerido si TRAIN_TOKEN está configurado como variable de entorno
     
     El entrenamiento puede tardar 1-2 minutos dependiendo del tamaño de los datos.
+    Después del entrenamiento, el modelo se recarga automáticamente en memoria.
     """
     secret = os.getenv("TRAIN_TOKEN")
     
@@ -407,6 +548,14 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
         
         print(f"Iniciando entrenamiento con datos desde: {cumulative_path}")
         out = train_model.train()
+        
+        # IMPORTANTE: Recargar modelo en memoria después de entrenar
+        try:
+            predict_model.reload_model()
+            out["model_reloaded"] = True
+        except Exception as e:
+            out["model_reload_error"] = str(e)
+            out["model_reloaded"] = False
         
         # Subir modelo y métricas a GCP
         if gcp_utils.is_initialized():
@@ -443,14 +592,16 @@ async def train_status():
     
     data_exists = os.path.exists(cumulative_path)
     model_exists = os.path.exists(model_path)
+    model_in_memory = predict_model._model_bundle is not None
     
     status = {
         "data_available": data_exists,
         "data_path": cumulative_path if data_exists else None,
         "model_exists": model_exists,
+        "model_in_memory": model_in_memory,
         "model_path": model_path if model_exists else None,
         "ready_to_train": data_exists,
-        "can_predict": model_exists,
+        "can_predict": model_exists and model_in_memory,
         "train_token_required": os.getenv("TRAIN_TOKEN") is not None,
         "gcp_enabled": gcp_utils.is_initialized()
     }
@@ -475,6 +626,8 @@ async def train_status():
         status["message"] = "Ejecuta GET /datasets para descargar los datos primero"
     elif not model_exists:
         status["message"] = "Datos disponibles. Ejecuta POST /train para entrenar el modelo"
+    elif not model_in_memory:
+        status["message"] = "Modelo en disco pero no en memoria. Reinicia el servidor o haz una predicción"
     else:
         status["message"] = "Todo listo. Puedes hacer predicciones en POST /predict"
     
@@ -502,7 +655,7 @@ async def list_cloud_files(prefix: str = Query("", description="Prefijo para fil
             detail="Google Cloud no está inicializado"
         )
     
-    files = gcp_utils.list_files(prefix=prefix)
+    files = list(gcp_utils.list_files(prefix=prefix))
     return {"files": files, "count": len(files)}
 
 @app.get("/cloud/models/versions", tags=["Cloud"])
@@ -522,7 +675,7 @@ async def download_model_from_cloud(
     version: str = Query("latest", description="Versión a descargar"),
     token: str = Query(None, description="Token de autorización")
 ):
-    """Descarga un modelo específico desde GCP"""
+    """Descarga un modelo específico desde GCP y lo carga en memoria"""
     secret = os.getenv("TRAIN_TOKEN")
     if secret and token != secret:
         raise HTTPException(status_code=403, detail="Token inválido")
@@ -531,20 +684,3 @@ async def download_model_from_cloud(
         raise HTTPException(
             status_code=503,
             detail="Google Cloud no está inicializado"
-        )
-    
-    local_path = gcp_utils.download_model(version=version)
-    if local_path:
-        return {"status": "ok", "message": f"Modelo descargado: {local_path}"}
-    else:
-        raise HTTPException(status_code=404, detail=f"No se encontró modelo versión '{version}'")
-
-# ---------- local ----------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        log_level="info"
-    )

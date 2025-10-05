@@ -3,6 +3,7 @@ import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from io import BytesIO
+from functools import lru_cache
 
 from google.cloud import storage
 from google.cloud import firestore
@@ -127,6 +128,26 @@ def download_file(remote_path: str, local_path: str) -> bool:
         print(f"❌ Error descargando archivo: {e}")
         return False
 
+def download_file_bytes(remote_path: str) -> Optional[bytes]:
+    """
+    Descarga un archivo como bytes directamente sin guardar en disco
+    
+    Args:
+        remote_path: Ruta en el bucket
+    
+    Returns:
+        Contenido del archivo en bytes o None si falla
+    """
+    if not _initialized:
+        return None
+    
+    try:
+        blob = _bucket.blob(remote_path)
+        return blob.download_as_bytes()
+    except Exception as e:
+        print(f"❌ Error descargando bytes: {e}")
+        return None
+
 def upload_bytes(data: bytes, remote_path: str, content_type: str = None) -> Optional[str]:
     """
     Sube bytes directamente a Cloud Storage
@@ -151,25 +172,26 @@ def upload_bytes(data: bytes, remote_path: str, content_type: str = None) -> Opt
         print(f"❌ Error subiendo bytes: {e}")
         return None
 
-def list_files(prefix: str = "") -> List[str]:
+@lru_cache(maxsize=10)
+def list_files(prefix: str = "") -> tuple:
     """
-    Lista archivos en el bucket con un prefijo dado
+    Lista archivos en el bucket con un prefijo dado (con caché)
     
     Args:
         prefix: Prefijo para filtrar (ej: "models/")
     
     Returns:
-        Lista de nombres de archivos
+        Tupla de nombres de archivos (inmutable para caché)
     """
     if not _initialized:
-        return []
+        return tuple()
     
     try:
         blobs = _bucket.list_blobs(prefix=prefix)
-        return [blob.name for blob in blobs]
+        return tuple(blob.name for blob in blobs)
     except Exception as e:
         print(f"❌ Error listando archivos: {e}")
-        return []
+        return tuple()
 
 def delete_file(remote_path: str) -> bool:
     """Elimina un archivo del bucket"""
@@ -180,13 +202,16 @@ def delete_file(remote_path: str) -> bool:
         blob = _bucket.blob(remote_path)
         blob.delete()
         print(f"✅ Archivo eliminado: {remote_path}")
+        # Limpiar caché
+        list_files.cache_clear()
         return True
     except Exception as e:
         print(f"❌ Error eliminando archivo: {e}")
         return False
 
+@lru_cache(maxsize=100)
 def file_exists(remote_path: str) -> bool:
-    """Verifica si un archivo existe en el bucket"""
+    """Verifica si un archivo existe en el bucket (con caché)"""
     if not _initialized:
         return False
     
@@ -328,6 +353,9 @@ def upload_model(local_path: str, version: str = None) -> Optional[str]:
     # También subir como "latest"
     if result:
         upload_file(local_path, f"models/latest/{filename}")
+        # Limpiar caché
+        list_files.cache_clear()
+        file_exists.cache_clear()
     
     return result
 
@@ -385,6 +413,7 @@ def upload_dataset(local_path: str, dataset_name: str) -> Optional[str]:
     # También subir como "latest"
     if result:
         upload_file(local_path, f"datasets/{dataset_name}_latest.csv")
+        list_files.cache_clear()
     
     return result
 
@@ -398,3 +427,9 @@ def download_dataset(dataset_name: str, local_path: str = None) -> Optional[str]
     if download_file(remote_path, local_path):
         return local_path
     return None
+
+def clear_cache():
+    """Limpia todos los cachés de lru_cache"""
+    list_files.cache_clear()
+    file_exists.cache_clear()
+    print("✅ Caché de GCP limpiado")

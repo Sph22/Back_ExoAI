@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
+from functools import lru_cache
 
 import math
 import numpy as np
@@ -12,7 +13,7 @@ import requests
 # === Config ===
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-TIMEOUT = 90
+TIMEOUT = 30  # Reducido de 90 a 30 segundos
 
 # Vistas web (solo referencia)
 VIEW_URLS = {
@@ -35,7 +36,7 @@ TAP_API = {
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+k2pandc&format=csv",
 }
 
-# Columnas “señuelo” para validar
+# Columnas "señuelo" para validar
 EXPECTED_COLS: Dict[str, List[str]] = {
     "cumulative": ["koi_disposition", "koi_period", "koi_prad"],
     "TOI":        ["tfopwg_disp", "pl_orbper", "pl_rade"],
@@ -84,13 +85,15 @@ def _download(url: str) -> Tuple[bytes, str]:
         "Accept": "text/csv, text/plain, */*",
         "Connection": "close",
     }
-    r = requests.get(url, timeout=TIMEOUT, headers=headers, allow_redirects=True)
-    r.raise_for_status()
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    data = r.content
-    if not data:
-        raise ValueError("Respuesta vacía")
-    return data, ctype
+    # Usar sesión para reutilizar conexiones
+    with requests.Session() as session:
+        r = session.get(url, timeout=TIMEOUT, headers=headers, allow_redirects=True)
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        data = r.content
+        if not data:
+            raise ValueError("Respuesta vacía")
+        return data, ctype
 
 
 def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
@@ -154,31 +157,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         except Exception:
             df = None
 
-    # 3) HTML (último recurso)
-    if df is None:
-        attempts.append(view_url)
-        try:
-            tables = pd.read_html(view_url, header=0)
-            if not tables:
-                tables = pd.read_html(view_url)
-            best_df = None
-            best_score = -1
-            for t in tables:
-                t.columns = [str(c) for c in t.columns]
-                score = int(t.shape[0]) * int(t.shape[1])
-                if t.shape[1] <= 2:
-                    continue
-                if score > best_score:
-                    best_score = score
-                    best_df = t
-            if best_df is not None and _valid_shape(best_df):
-                df = best_df
-                buf = io.StringIO()
-                best_df.to_csv(buf, index=False)
-                data = buf.getvalue().encode("utf-8")
-                parse_method = "html"
-        except Exception:
-            pass
+    # 3) HTML (último recurso) - REMOVIDO para optimizar tiempo
 
     if df is None:
         return {
@@ -262,7 +241,6 @@ def _to_json_safe(v):
             if not math.isfinite(v):
                 return None
             return float(v)
-        # pandas NA / numpy nan
         if isinstance(v, (str, int, bool)):
             return v
         if pd.isna(v):
@@ -270,6 +248,15 @@ def _to_json_safe(v):
     except Exception:
         return None
     return v if isinstance(v, (str, int, bool, float)) else str(v)
+
+
+@lru_cache(maxsize=3)
+def _cached_read_csv(path: str, mtime: float) -> Optional[pd.DataFrame]:
+    """
+    Lee CSV con caché basado en tiempo de modificación.
+    El parámetro mtime fuerza invalidación de caché cuando el archivo cambia.
+    """
+    return _read_csv_from_path_like_download(path)
 
 
 def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
@@ -289,8 +276,8 @@ def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
                 path,
                 comment="#",
                 engine="python",
-                sep=None,       # autodetección
-                dtype=str,      # evita problemas de tipos/NaN como floats
+                sep=None,
+                dtype=str,
                 on_bad_lines="skip",
                 encoding=enc,
             )
@@ -302,7 +289,7 @@ def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
 
 
 def preview(n: int = 5) -> Dict:
-    """Devuelve head(n) por dataset leyendo desde disco (sin NaN/Inf en el JSON)."""
+    """Devuelve head(n) por dataset leyendo desde disco con caché (sin NaN/Inf en el JSON)."""
     out = {"datasets": {}}
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
@@ -310,7 +297,13 @@ def preview(n: int = 5) -> Dict:
             out["datasets"][key] = {"error": "No existe archivo latest. Ejecuta /datasets primero."}
             continue
 
-        df = _read_csv_from_path_like_download(latest_path)
+        # Usar caché basado en tiempo de modificación
+        try:
+            mtime = os.path.getmtime(latest_path)
+            df = _cached_read_csv(latest_path, mtime)
+        except Exception:
+            df = None
+
         if df is None:
             out["datasets"][key] = {
                 "error": f"No se pudo leer {latest_path} con los métodos de fallback."
@@ -333,3 +326,63 @@ def preview(n: int = 5) -> Dict:
             "latest_path": latest_path,
         }
     return out
+
+
+def get_first_n_with_names(n: int = 3) -> Dict:
+    """
+    Obtiene los primeros N registros de cumulative con nombre del exoplaneta.
+    Devuelve datos completos + nombre si está disponible.
+    """
+    cumulative_path = os.path.join(DATA_DIR, "cumulative.csv")
+    if not os.path.exists(cumulative_path):
+        return {"error": "No existe cumulative.csv. Ejecuta /datasets primero."}
+    
+    try:
+        mtime = os.path.getmtime(cumulative_path)
+        df = _cached_read_csv(cumulative_path, mtime)
+    except Exception:
+        df = None
+    
+    if df is None:
+        return {"error": "No se pudo leer cumulative.csv"}
+    
+    # Tomar primeros N registros
+    subset = df.head(n)
+    
+    # Columnas de interés para features + nombre
+    feature_cols = ["koi_period", "koi_duration", "koi_depth", "koi_prad", 
+                    "koi_insol", "koi_steff", "koi_srad", "koi_disposition"]
+    
+    # Buscar columna de nombre (puede ser 'kepler_name', 'kepoi_name', etc.)
+    name_col = None
+    for possible_name in ["kepler_name", "kepoi_name", "koi_name", "pl_name"]:
+        if possible_name in df.columns:
+            name_col = possible_name
+            break
+    
+    results = []
+    for idx, row in subset.iterrows():
+        record = {}
+        
+        # Agregar features
+        for col in feature_cols:
+            if col in df.columns:
+                record[col] = _to_json_safe(row[col])
+        
+        # Agregar nombre si existe
+        if name_col:
+            record["exoplanet_name"] = _to_json_safe(row[name_col])
+        else:
+            record["exoplanet_name"] = None
+        
+        # Agregar ID del registro
+        record["row_index"] = int(idx)
+        
+        results.append(record)
+    
+    return {
+        "count": len(results),
+        "records": results,
+        "name_column_used": name_col,
+        "dataset": "cumulative"
+    }
