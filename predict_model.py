@@ -6,17 +6,31 @@ import numpy as np
 
 MODEL_PATH = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
 
+# Caché global del modelo (se carga solo una vez)
 _model_bundle = None
 
-def _load_bundle():
+def load_bundle():
+    """
+    Carga el modelo solo una vez y lo mantiene en memoria.
+    Esto evita recargar desde disco en cada predicción.
+    """
     global _model_bundle
     if _model_bundle is None:
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"No existe el modelo en {MODEL_PATH}. Entrena primero.")
+        print(f"🔄 Cargando modelo desde {MODEL_PATH}...")
         _model_bundle = joblib.load(MODEL_PATH)
+        print("✅ Modelo cargado en memoria")
     return _model_bundle
 
+def reload_model():
+    """Fuerza recarga del modelo (útil después de reentrenar)"""
+    global _model_bundle
+    _model_bundle = None
+    return load_bundle()
+
 def _ensure_order(x: Dict[str, float], features: List[str]) -> List[float]:
+    """Convierte diccionario a array en el orden correcto de features"""
     return [float(x.get(f, np.nan)) for f in features]
 
 def predict_one(payload: Dict[str, float]) -> Dict[str, Union[str, float, Dict]]:
@@ -34,7 +48,7 @@ def predict_one(payload: Dict[str, float]) -> Dict[str, Union[str, float, Dict]]
             }
         }
     """
-    bundle = _load_bundle()
+    bundle = load_bundle()
     imputer = bundle["imputer"]
     clf = bundle["classifier"]
     features = bundle.get("features", ["period","duration","depth","radius","insolation","teff","srad"])
@@ -66,12 +80,12 @@ def predict_one(payload: Dict[str, float]) -> Dict[str, Union[str, float, Dict]]
 
 def predict_batch(payload: List[Dict[str, float]]) -> List[Dict[str, Union[str, float, Dict]]]:
     """
-    Realiza predicciones en batch
+    Realiza predicciones en batch (más eficiente para múltiples predicciones)
     
     Returns:
         Lista de diccionarios con predicciones y probabilidades
     """
-    bundle = _load_bundle()
+    bundle = load_bundle()
     imputer = bundle["imputer"]
     clf = bundle["classifier"]
     features = bundle.get("features", ["period","duration","depth","radius","insolation","teff","srad"])
