@@ -2,41 +2,61 @@ import io
 import json
 import os
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import pandas as pd
 import requests
 
-# Carpeta donde guardaremos datasets y el manifest
+# === Config ===
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+TIMEOUT = 90
 
-# Vistas de tabla (páginas) que compartiste
+# Vistas web (solo referencia)
 VIEW_URLS = {
     "cumulative": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView?app=ExoTbls&config=cumulative",
     "TOI":        "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView?app=ExoTbls&config=TOI",
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView?app=ExoTbls&config=k2pandc",
 }
 
-def _candidate_csv_urls(view_url: str) -> list[str]:
-    # Probamos varias variantes conocidas
-    base_has_q = "?" in view_url
-    joiner = "&" if base_has_q else "?"
-    return [
-        f"{view_url}{joiner}output=csv",
-        f"{view_url}{joiner}format=csv",
-    ]
+# 1) API clásica (CSV directo)
+NSTED_API = {
+    # KOI cumulative (Kepler)
+    "cumulative": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=cumulative&select=*"
+                  "&format=csv",
+    # TESS Objects of Interest
+    "TOI": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*"
+           "&format=csv",
+    # K2 confirmed & candidates
+    "k2pandc": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=k2pandc&select=*"
+               "&format=csv",
+}
+
+# 2) TAP (ADQL)
+TAP_API = {
+    "cumulative": "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+cumulative&format=csv",
+    "TOI":        "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+toi&format=csv",
+    "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+k2pandc&format=csv",
+}
+
+# Columnas “señuelo” para validar que bajamos la tabla correcta
+EXPECTED_COLS: Dict[str, List[str]] = {
+    "cumulative": ["koi_disposition", "koi_period", "koi_prad"],
+    "TOI":        ["tfopwg_disp", "pl_orbper", "pl_rade"],
+    "k2pandc":    ["disposition", "pl_orbper", "pl_rade"],
+}
+
 
 def _sha256_bytes(data: bytes) -> str:
     import hashlib
     return hashlib.sha256(data).hexdigest()
+
 
 def _save_bytes(name: str, data: bytes) -> Tuple[str, str]:
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     path = os.path.join(DATA_DIR, f"{name}_{ts}.csv")
     with open(path, "wb") as f:
         f.write(data)
-    # Copia como “latest”
     latest = os.path.join(DATA_DIR, f"{name}.csv")
     try:
         if os.path.islink(latest) or os.path.exists(latest):
@@ -47,6 +67,7 @@ def _save_bytes(name: str, data: bytes) -> Tuple[str, str]:
         f.write(data)
     return path, latest
 
+
 def _load_manifest() -> Dict:
     manifest_path = os.path.join(DATA_DIR, "manifest.json")
     if os.path.exists(manifest_path):
@@ -54,145 +75,152 @@ def _load_manifest() -> Dict:
             return json.load(f)
     return {"datasets": {}}
 
+
 def _save_manifest(manifest: Dict) -> None:
     manifest_path = os.path.join(DATA_DIR, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
+
 def _download(url: str) -> Tuple[bytes, str]:
-    """Descarga y regresa (contenido, content_type)."""
-    r = requests.get(url, timeout=60)
+    r = requests.get(url, timeout=TIMEOUT)
     r.raise_for_status()
     ctype = r.headers.get("Content-Type", "").lower()
     return r.content, ctype
 
-def _looks_like_csv(data: bytes, content_type: str) -> bool:
-    """Heurística para decidir si los bytes representan CSV."""
-    if "text/csv" in content_type or "application/csv" in content_type:
-        return True
-    head = data[:200].lstrip()
-    if head.startswith(b"<") or b"<html" in head.lower():
-        return False
-    return b"," in head and b"\n" in data[:1000]
 
-def _read_as_csv_bytes(data: bytes) -> pd.DataFrame:
-    """Lee CSV de forma tolerante."""
+def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
+    """Lee CSV tolerante a ‘bad lines’ y comentarios con ‘#’."""
     bio = io.BytesIO(data)
     return pd.read_csv(bio, comment="#", engine="python", on_bad_lines="skip")
 
-def _best_html_table(url: str) -> tuple[pd.DataFrame, dict]:
-    """
-    Lee TODAS las tablas HTML y elige la mejor:
-    - mayor score = filas * columnas
-    - descarta tablas con <= 2 columnas
-    Devuelve (df, info) con métricas de selección.
-    """
-    # Intento 1: asumir encabezados en la primera fila
-    tables = pd.read_html(url, header=0)  # requiere lxml
-    if not tables:
-        # Intento 2: sin header (pandas decide)
-        tables = pd.read_html(url)
-        if not tables:
-            raise RuntimeError("No se encontraron tablas HTML en la página.")
 
-    scored = []
-    for idx, t in enumerate(tables):
-        # Normaliza nombres a str
-        t.columns = [str(c) for c in t.columns]
-        n_rows, n_cols = t.shape
-        # descartamos tablas triviales
-        if n_cols <= 2:
+def _valid_shape(df: pd.DataFrame) -> bool:
+    # descartamos tablas triviales
+    return (df.shape[0] >= 5) and (df.shape[1] >= 5)
+
+
+def _has_expected_cols(df: pd.DataFrame, keys: List[str]) -> bool:
+    cols = set(map(str, df.columns))
+    return any(k in cols for k in keys)
+
+
+def _fetch_one(key: str, view_url: str) -> Dict:
+    """Descarga un dataset por ‘key’ usando nstedAPI, TAP y (solo último recurso) HTML."""
+    attempts = []
+    parse_method = None
+    df = None
+    data = b""
+    content_type = ""
+
+    # 1) nstedAPI
+    for api_url in [NSTED_API[key]]:
+        attempts.append(api_url)
+        try:
+            data, content_type = _download(api_url)
+            tmp = _read_csv_bytes_loose(data)
+            if _valid_shape(tmp) and _has_expected_cols(tmp, EXPECTED_COLS[key]):
+                df = tmp
+                parse_method = "nstedAPI"
+                break
+        except Exception:
             continue
-        score = int(n_rows) * int(n_cols)
-        scored.append((score, idx, n_rows, n_cols, t))
 
-    if not scored:
-        # Si todas eran triviales, como último recurso usa la primera
-        t0 = tables[0]
-        t0.columns = [str(c) for c in t0.columns]
-        return t0, {"selected_index": 0, "selected_shape": t0.shape, "tables_found": len(tables)}
+    # 2) TAP
+    if df is None:
+        for api_url in [TAP_API[key]]:
+            attempts.append(api_url)
+            try:
+                data, content_type = _download(api_url)
+                tmp = _read_csv_bytes_loose(data)
+                if _valid_shape(tmp) and _has_expected_cols(tmp, EXPECTED_COLS[key]):
+                    df = tmp
+                    parse_method = "tap"
+                    break
+            except Exception:
+                continue
 
-    scored.sort(reverse=True)  # mejor score primero
-    best = scored[0]
-    _, idx, n_rows, n_cols, df = best
-    return df, {
-        "selected_index": idx,
-        "selected_shape": (int(n_rows), int(n_cols)),
-        "tables_found": len(tables),
+    # 3) HTML (último recurso) – buscamos la tabla grande
+    if df is None:
+        attempts.append(view_url)
+        try:
+            tables = pd.read_html(view_url, header=0)
+            if not tables:
+                tables = pd.read_html(view_url)
+            best_df = None
+            best_score = -1
+            for t in tables:
+                t.columns = [str(c) for c in t.columns]
+                score = int(t.shape[0]) * int(t.shape[1])
+                if t.shape[1] <= 2:
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_df = t
+            if best_df is not None:
+                df = best_df
+                # convertir a bytes CSV para guardar
+                buf = io.StringIO()
+                best_df.to_csv(buf, index=False)
+                data = buf.getvalue().encode("utf-8")
+                parse_method = "html"
+        except Exception:
+            pass
+
+    if df is None:
+        raise RuntimeError(f"No se pudo obtener un CSV válido para {key} (intentos={attempts}).")
+
+    return {
+        "df": df,
+        "data": data,
+        "content_type": content_type,
+        "parse_method": parse_method,
+        "attempts": attempts,
     }
+
 
 def fetch_all(auto_save: bool = True) -> Dict:
     """
-    Descarga los 3 datasets. Intenta CSV directo con varias variantes;
-    si la respuesta no es CSV o falla el parser, hace fallback a parseo HTML
-    escogiendo la tabla más grande (filas×columnas).
+    Descarga los 3 datasets usando primero las APIs oficiales (nstedAPI/TAP).
+    Si fallan, cae a HTML como último recurso.
     Guarda:
       - data/<name>_YYYYMMDDThhmmssZ.csv
       - data/<name>.csv              (último)
-      - data/manifest.json           (hash y metadata)
-    Devuelve metadata con filas/columnas, parse_method y tabla elegida.
+      - data/manifest.json
     """
     manifest = _load_manifest()
     result = {"datasets": {}, "change_detected": False}
 
     for key, view_url in VIEW_URLS.items():
-        tried_csv_urls = _candidate_csv_urls(view_url)
+        got = _fetch_one(key, view_url)
+        df: pd.DataFrame = got["df"]
+        data: bytes = got["data"]
+        ctype: str = got["content_type"]
+        parse_method: str = got["parse_method"]
+        attempts: List[str] = got["attempts"]
 
-        data = b""
-        ctype = ""
-        chosen_csv_url = None
-        df = None
-        parse_method = "csv"
-
-        # 1) Intentar CSV con varias rutas
-        for u in tried_csv_urls:
-            try:
-                _data, _ctype = _download(u)
-                if _looks_like_csv(_data, _ctype):
-                    # Validar que lo podamos leer
-                    tmp_df = _read_as_csv_bytes(_data)
-                    if tmp_df.shape[1] > 2 and tmp_df.shape[0] > 1:
-                        data, ctype, df, chosen_csv_url = _data, _ctype, tmp_df, u
-                        parse_method = "csv"
-                        break
-            except Exception:
-                continue  # probamos la siguiente
-
-        # 2) Fallback a HTML si no hubo CSV válido
-        html_select_info = {}
-        if df is None:
-            parse_method = "html"
-            df, html_select_info = _best_html_table(view_url)
-            buf = io.StringIO()
-            df.to_csv(buf, index=False)
-            data = buf.getvalue().encode("utf-8")
-
-        # 3) Guardar artefactos
+        # Guardado y hash
         sha = _sha256_bytes(data)
         prev_sha = manifest["datasets"].get(key, {}).get("sha256")
-
         saved_path, latest_path = _save_bytes(key, data)
 
         meta = {
             "rows": int(df.shape[0]),
             "cols": int(df.shape[1]),
-            "columns": list(df.columns[:50]),
+            "columns": list(map(str, df.columns[:50])),
             "saved_path": saved_path,
             "latest_path": latest_path,
             "sha256": sha,
             "source_view": view_url,
-            "csv_attempts": tried_csv_urls,
-            "csv_used": chosen_csv_url,
+            "attempts": attempts,
             "content_type": ctype,
-            "parse_method": parse_method,              # csv | html
-            "html_selection": html_select_info,        # índice/shape elegidos
+            "parse_method": parse_method,        # nstedAPI | tap | html
             "updated_at_utc": datetime.utcnow().isoformat() + "Z",
             "changed": (prev_sha is None) or (prev_sha != sha),
         }
         result["datasets"][key] = meta
 
         manifest["datasets"][key] = {"sha256": sha, "latest_path": latest_path}
-
         if meta["changed"]:
             result["change_detected"] = True
 
@@ -201,8 +229,9 @@ def fetch_all(auto_save: bool = True) -> Dict:
 
     return result
 
+
 def preview(n: int = 5) -> Dict:
-    """Devuelve head(n) de cada dataset y métricas básicas usando los archivos “latest”."""
+    """Devuelve head(n) de cada dataset usando los archivos “latest”."""
     out = {"datasets": {}}
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
@@ -213,7 +242,7 @@ def preview(n: int = 5) -> Dict:
         out["datasets"][key] = {
             "rows": int(df.shape[0]),
             "cols": int(df.shape[1]),
-            "columns": list(df.columns[:50]),
+            "columns": list(map(str, df.columns[:50])),
             "head": df.head(n).to_dict(orient="records"),
             "latest_path": latest_path,
         }
