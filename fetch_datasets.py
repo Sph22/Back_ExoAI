@@ -22,7 +22,6 @@ VIEW_URLS = {
 # 1) API clásica (CSV directo)
 NSTED_API = {
     "cumulative": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=cumulative&select=*&format=csv",
-    # TOI puede traer dos nombres distintos; lo manejamos en _fetch_one
     "TOI":        "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=k2pandc&select=*&format=csv",
 }
@@ -34,7 +33,7 @@ TAP_API = {
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+k2pandc&format=csv",
 }
 
-# Columnas “señuelo” para validar que bajamos la tabla correcta
+# Columnas “señuelo” para validar
 EXPECTED_COLS: Dict[str, List[str]] = {
     "cumulative": ["koi_disposition", "koi_period", "koi_prad"],
     "TOI":        ["tfopwg_disp", "pl_orbper", "pl_rade"],
@@ -78,7 +77,6 @@ def _save_manifest(manifest: Dict) -> None:
 
 
 def _download(url: str) -> Tuple[bytes, str]:
-    """Descarga con headers explícitos para evitar bloqueos por User-Agent."""
     headers = {
         "User-Agent": "ExoAI/1.0 (+https://render.com) Python-requests",
         "Accept": "text/csv, text/plain, */*",
@@ -94,7 +92,6 @@ def _download(url: str) -> Tuple[bytes, str]:
 
 
 def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
-    """Lee CSV tolerante a ‘bad lines’ y comentarios con ‘#’ (sin low_memory)."""
     bio = io.BytesIO(data)
     return pd.read_csv(
         bio,
@@ -114,21 +111,13 @@ def _has_expected_cols(df: pd.DataFrame, keys: List[str]) -> bool:
 
 
 def _fetch_one(key: str, view_url: str) -> Dict:
-    """
-    Descarga un dataset por ‘key’ usando nstedAPI, TAP y (último recurso) HTML.
-    Devuelve dict con:
-      - df: DataFrame (puede ser vacío si no se logró)
-      - data: bytes del CSV (solo si se logró)
-      - parse_method: 'nstedAPI' | 'tap' | 'html' | 'error'
-      - attempts: lista de URLs/acciones probadas
-    """
     attempts = []
     parse_method = None
     df: Optional[pd.DataFrame] = None
     data = b""
     content_type = ""
 
-    # 1️⃣ nstedAPI (TOI puede tener nombre alternativo)
+    # 1) nstedAPI (TOI puede alternar nombre)
     nsted_candidates = (
         [
             "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
@@ -137,7 +126,6 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         if key == "TOI"
         else [NSTED_API[key]]
     )
-
     for api_url in nsted_candidates:
         attempts.append(api_url)
         try:
@@ -150,7 +138,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         except Exception:
             continue
 
-    # 2️⃣ TAP (si nstedAPI falló)
+    # 2) TAP
     if df is None:
         api_url = TAP_API[key]
         attempts.append(api_url)
@@ -163,7 +151,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         except Exception:
             df = None
 
-    # 3️⃣ HTML (último recurso). Intentamos parsear tabla grande.
+    # 3) HTML (último recurso)
     if df is None:
         attempts.append(view_url)
         try:
@@ -190,7 +178,6 @@ def _fetch_one(key: str, view_url: str) -> Dict:
             pass
 
     if df is None:
-        # NO guardamos archivos vacíos
         return {
             "df": pd.DataFrame(),
             "data": b"",
@@ -211,14 +198,6 @@ def _fetch_one(key: str, view_url: str) -> Dict:
 
 
 def fetch_all(auto_save: bool = True) -> Dict:
-    """
-    Descarga los 3 datasets usando primero las APIs oficiales (nstedAPI/TAP).
-    Si fallan, cae a HTML como último recurso.
-    Guarda:
-      - data/<name>_YYYYMMDDThhmmssZ.csv
-      - data/<name>.csv              (último)
-      - data/manifest.json
-    """
     manifest = _load_manifest()
     result = {"datasets": {}, "change_detected": False}
 
@@ -241,13 +220,12 @@ def fetch_all(auto_save: bool = True) -> Dict:
             "source_view": view_url,
             "attempts": attempts,
             "content_type": ctype,
-            "parse_method": parse_method,        # nstedAPI | tap | html | error
+            "parse_method": parse_method,
             "updated_at_utc": datetime.utcnow().isoformat() + "Z",
             "changed": False,
         }
 
         if saved:
-            # Guardado y hash
             sha = _sha256_bytes(data)
             prev_sha = manifest["datasets"].get(key, {}).get("sha256")
             saved_path, latest_path = _save_bytes(key, data)
@@ -270,10 +248,8 @@ def fetch_all(auto_save: bool = True) -> Dict:
 
 
 # ---------- PREVIEW ROBUSTO ----------
-def _read_csv_robust(path: str) -> pd.DataFrame:
-    """
-    Intenta varias estrategias de lectura sin 'low_memory' cuando engine='python'.
-    """
+def _read_csv_robust(path: str) -> Optional[pd.DataFrame]:
+    """Devuelve DataFrame o None; nunca levanta excepción hacia arriba."""
     # 1) utf-8
     try:
         return pd.read_csv(
@@ -284,7 +260,6 @@ def _read_csv_robust(path: str) -> pd.DataFrame:
         )
     except Exception:
         pass
-
     # 2) latin-1
     try:
         return pd.read_csv(
@@ -294,32 +269,27 @@ def _read_csv_robust(path: str) -> pd.DataFrame:
             on_bad_lines="skip",
             encoding="latin1",
         )
-    except Exception as e:
-        raise e
+    except Exception:
+        return None
 
 
 def preview(n: int = 5) -> Dict:
-    """
-    Devuelve head(n) de cada dataset usando los archivos “latest”.
-    Nunca lanza excepción general; anota 'error' por dataset si algo falla.
-    """
+    """Devuelve head(n) de cada dataset o un error por dataset. Nunca lanza excepción."""
     out = {"datasets": {}}
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
         if not os.path.exists(latest_path):
             out["datasets"][key] = {"error": "No existe archivo latest. Ejecuta /datasets primero."}
             continue
-        try:
-            df = _read_csv_robust(latest_path)
-            out["datasets"][key] = {
-                "rows": int(df.shape[0]),
-                "cols": int(df.shape[1]),
-                "columns": list(map(str, df.columns[:50])),
-                "head": df.head(n).to_dict(orient="records"),
-                "latest_path": latest_path,
-            }
-        except Exception as e:
-            out["datasets"][key] = {
-                "error": f"No se pudo leer {latest_path}: {type(e).__name__}: {e}"
-            }
+        df = _read_csv_robust(latest_path)
+        if df is None:
+            out["datasets"][key] = {"error": f"No se pudo leer {latest_path}."}
+            continue
+        out["datasets"][key] = {
+            "rows": int(df.shape[0]),
+            "cols": int(df.shape[1]),
+            "columns": list(map(str, df.columns[:50])),
+            "head": df.head(n).to_dict(orient="records"),
+            "latest_path": latest_path,
+        }
     return out
