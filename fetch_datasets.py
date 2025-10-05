@@ -2,7 +2,7 @@ import io
 import json
 import os
 from datetime import datetime
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import pandas as pd
 import requests
@@ -21,12 +21,10 @@ VIEW_URLS = {
 
 # 1) API clásica (CSV directo)
 NSTED_API = {
-    "cumulative": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=cumulative&select=*"
-                  "&format=csv",
-    "TOI":        "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=poi_toi&select=*"
-                  "&format=csv",  # algunas instalaciones usan 'poi_toi'; si no, cae a TAP
-    "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=k2pandc&select=*"
-                  "&format=csv",
+    "cumulative": "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=cumulative&select=*&format=csv",
+    # TOI puede traer dos nombres distintos; lo manejamos en _fetch_one
+    "TOI":        "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
+    "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=k2pandc&select=*&format=csv",
 }
 
 # 2) TAP (ADQL)
@@ -80,21 +78,29 @@ def _save_manifest(manifest: Dict) -> None:
 
 
 def _download(url: str) -> Tuple[bytes, str]:
-    r = requests.get(url, timeout=TIMEOUT)
+    """Descarga con headers explícitos para evitar bloqueos por User-Agent."""
+    headers = {
+        "User-Agent": "ExoAI/1.0 (+https://render.com) Python-requests",
+        "Accept": "text/csv, text/plain, */*",
+        "Connection": "close",
+    }
+    r = requests.get(url, timeout=TIMEOUT, headers=headers, allow_redirects=True)
     r.raise_for_status()
-    ctype = r.headers.get("Content-Type", "").lower()
-    return r.content, ctype
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    data = r.content
+    if not data:
+        raise ValueError("Respuesta vacía")
+    return data, ctype
 
 
 def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
-    """Lee CSV tolerante a ‘bad lines’ y comentarios con ‘#’."""
+    """Lee CSV tolerante a ‘bad lines’ y comentarios con ‘#’ (sin low_memory)."""
     bio = io.BytesIO(data)
     return pd.read_csv(
         bio,
         comment="#",
         engine="python",
         on_bad_lines="skip",
-        low_memory=False,
     )
 
 
@@ -108,22 +114,29 @@ def _has_expected_cols(df: pd.DataFrame, keys: List[str]) -> bool:
 
 
 def _fetch_one(key: str, view_url: str) -> Dict:
-    """Descarga un dataset por ‘key’ usando nstedAPI, TAP y (último recurso) HTML."""
+    """
+    Descarga un dataset por ‘key’ usando nstedAPI, TAP y (último recurso) HTML.
+    Devuelve dict con:
+      - df: DataFrame (puede ser vacío si no se logró)
+      - data: bytes del CSV (solo si se logró)
+      - parse_method: 'nstedAPI' | 'tap' | 'html' | 'error'
+      - attempts: lista de URLs/acciones probadas
+    """
     attempts = []
     parse_method = None
-    df = None
+    df: Optional[pd.DataFrame] = None
     data = b""
     content_type = ""
 
     # 1️⃣ nstedAPI (TOI puede tener nombre alternativo)
-    nsted_candidates = []
-    if key == "TOI":
-        nsted_candidates = [
+    nsted_candidates = (
+        [
             "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
             "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=poi_toi&select=*&format=csv",
         ]
-    else:
-        nsted_candidates = [NSTED_API[key]]
+        if key == "TOI"
+        else [NSTED_API[key]]
+    )
 
     for api_url in nsted_candidates:
         attempts.append(api_url)
@@ -150,7 +163,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         except Exception:
             df = None
 
-    # 3️⃣ HTML (último recurso)
+    # 3️⃣ HTML (último recurso). Intentamos parsear tabla grande.
     if df is None:
         attempts.append(view_url)
         try:
@@ -167,7 +180,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
                 if score > best_score:
                     best_score = score
                     best_df = t
-            if best_df is not None:
+            if best_df is not None and _valid_shape(best_df):
                 df = best_df
                 buf = io.StringIO()
                 best_df.to_csv(buf, index=False)
@@ -177,13 +190,14 @@ def _fetch_one(key: str, view_url: str) -> Dict:
             pass
 
     if df is None:
-        # Si no se pudo obtener, devolvemos una advertencia pero no rompemos todo
+        # NO guardamos archivos vacíos
         return {
             "df": pd.DataFrame(),
             "data": b"",
             "content_type": "",
             "parse_method": "error",
             "attempts": attempts + ["❌ No se obtuvo CSV válido"],
+            "saved": False,
         }
 
     return {
@@ -192,6 +206,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         "content_type": content_type,
         "parse_method": parse_method,
         "attempts": attempts,
+        "saved": True,
     }
 
 
@@ -214,31 +229,39 @@ def fetch_all(auto_save: bool = True) -> Dict:
         ctype: str = got["content_type"]
         parse_method: str = got["parse_method"]
         attempts: List[str] = got["attempts"]
-
-        # Guardado y hash
-        sha = _sha256_bytes(data)
-        prev_sha = manifest["datasets"].get(key, {}).get("sha256")
-        saved_path, latest_path = _save_bytes(key, data)
+        saved = got["saved"]
 
         meta = {
             "rows": int(df.shape[0]),
             "cols": int(df.shape[1]),
             "columns": list(map(str, df.columns[:50])),
-            "saved_path": saved_path,
-            "latest_path": latest_path,
-            "sha256": sha,
+            "saved_path": None,
+            "latest_path": None,
+            "sha256": None,
             "source_view": view_url,
             "attempts": attempts,
             "content_type": ctype,
-            "parse_method": parse_method,        # nstedAPI | tap | html
+            "parse_method": parse_method,        # nstedAPI | tap | html | error
             "updated_at_utc": datetime.utcnow().isoformat() + "Z",
-            "changed": (prev_sha is None) or (prev_sha != sha),
+            "changed": False,
         }
-        result["datasets"][key] = meta
 
-        manifest["datasets"][key] = {"sha256": sha, "latest_path": latest_path}
-        if meta["changed"]:
-            result["change_detected"] = True
+        if saved:
+            # Guardado y hash
+            sha = _sha256_bytes(data)
+            prev_sha = manifest["datasets"].get(key, {}).get("sha256")
+            saved_path, latest_path = _save_bytes(key, data)
+            meta.update({
+                "saved_path": saved_path,
+                "latest_path": latest_path,
+                "sha256": sha,
+                "changed": (prev_sha is None) or (prev_sha != sha),
+            })
+            manifest["datasets"][key] = {"sha256": sha, "latest_path": latest_path}
+            if meta["changed"]:
+                result["change_detected"] = True
+
+        result["datasets"][key] = meta
 
     if auto_save:
         _save_manifest(manifest)
@@ -249,30 +272,26 @@ def fetch_all(auto_save: bool = True) -> Dict:
 # ---------- PREVIEW ROBUSTO ----------
 def _read_csv_robust(path: str) -> pd.DataFrame:
     """
-    Intenta varias estrategias de lectura para evitar ParserError/codificación.
+    Intenta varias estrategias de lectura sin 'low_memory' cuando engine='python'.
     """
-    # 1) utf-8 + engine python
+    # 1) utf-8
     try:
         return pd.read_csv(
             path,
             comment="#",
             engine="python",
             on_bad_lines="skip",
-            low_memory=False,
         )
     except Exception:
         pass
 
-    # 2) utf-8 con sep autodetectado por el motor 'python' ya probado arriba: omitimos
-
-    # 3) latin-1 como fallback duro
+    # 2) latin-1
     try:
         return pd.read_csv(
             path,
             comment="#",
             engine="python",
             on_bad_lines="skip",
-            low_memory=False,
             encoding="latin1",
         )
     except Exception as e:
