@@ -1,0 +1,31 @@
+name: Auto Update & Retrain (Render)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # cada 30 minutos (UTC). Cambia a "0 * * * *" para cada hora.
+  workflow_dispatch:          # permite lanzarlo manualmente
+
+jobs:
+  update-and-maybe-retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health (opcional, mantiene vivo)
+        run: |
+          curl -fsS "${{ secrets.RENDER_BASE_URL }}/" || exit 1
+
+      - name: Fetch datasets (con auto_retrain si cambió)
+        run: |
+          URL="${{ secrets.RENDER_BASE_URL }}/datasets?auto_retrain=true&token=${{ secrets.TRAIN_TOKEN }}"
+          echo "Haciendo GET: $URL"
+          curl -fsS "$URL" -H "Accept: application/json" | tee response.json
+          echo "Respuesta guardada en response.json"
+
+      # Opcional: revisar si reentrenó y mostrar un resumen
+      - name: Mostrar resumen
+        run: |
+          if command -v jq >/dev/null 2>&1; then
+            echo "== Resumen =="
+            jq '{change_detected: .change_detected, retrain_started: .retrain_started, datasets: (.datasets | with_entries(.value |= {rows: .rows, cols: .cols, changed: .changed}))}' response.json
+          else
+            echo "Instala jq si quieres resumen; output completo arriba."
+          fi
