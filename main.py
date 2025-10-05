@@ -320,8 +320,19 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
     El entrenamiento puede tardar 1-2 minutos dependiendo del tamaño de los datos.
     """
     secret = os.getenv("TRAIN_TOKEN")
-    if secret and token != secret:
-        raise HTTPException(status_code=403, detail="Token inválido")
+    
+    # Validar token solo si está configurado
+    if secret:
+        if not token:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Token requerido. TRAIN_TOKEN está configurado."
+            )
+        if token != secret:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Token inválido. Recibido: '{token[:5]}...'"
+            )
     
     try:
         # Verificar que existan los datos
@@ -332,15 +343,25 @@ async def train_endpoint(token: str = Query(None, description="Token de autoriza
                 detail="No hay datos para entrenar. Ejecuta GET /datasets primero."
             )
         
+        print(f"🎯 Iniciando entrenamiento con datos desde: {cumulative_path}")
         out = train_model.train()
+        print(f"✅ Entrenamiento completado: {out}")
+        
         return JSONResponse(js(out), status_code=200)
     
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        error_detail = {
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }
+        print(f"❌ Error en /train: {error_detail}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error durante el entrenamiento: {str(e)}"
+            detail=error_detail
         )
 
 @app.get("/train/status", tags=["ML"])
@@ -358,8 +379,22 @@ async def train_status():
         "model_exists": model_exists,
         "model_path": model_path if model_exists else None,
         "ready_to_train": data_exists,
-        "can_predict": model_exists
+        "can_predict": model_exists,
+        "train_token_required": os.getenv("TRAIN_TOKEN") is not None
     }
+    
+    # Si hay datos, verificar contenido
+    if data_exists:
+        try:
+            import pandas as pd
+            df = pd.read_csv(cumulative_path, nrows=5)
+            status["data_sample"] = {
+                "rows_sample": len(df),
+                "total_columns": len(df.columns),
+                "columns_preview": list(df.columns[:20])
+            }
+        except Exception as e:
+            status["data_read_error"] = str(e)
     
     if not data_exists:
         status["message"] = "Ejecuta GET /datasets para descargar los datos primero"
