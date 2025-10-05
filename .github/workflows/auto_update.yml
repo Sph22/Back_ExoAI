@@ -1,0 +1,74 @@
+name: Auto-Update Exoplanet Data
+
+on:
+  schedule:
+    # Ejecutar cada 6 horas: a las 00:00, 06:00, 12:00, 18:00 UTC
+    - cron: '0 */6 * * *'
+  
+  # Permitir ejecución manual desde GitHub Actions
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Forzar actualización completa'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Trigger Auto-Update
+        run: |
+          echo "🤖 Iniciando actualización automática de datos..."
+          
+          # Endpoint según el input
+          if [ "${{ github.event.inputs.force_update }}" == "true" ]; then
+            ENDPOINT="https://back-exoai.onrender.com/auto-update/force"
+            echo "🔥 Modo: Actualización forzada"
+          else
+            ENDPOINT="https://back-exoai.onrender.com/auto-update"
+            echo "✅ Modo: Actualización inteligente (solo si hay cambios)"
+          fi
+          
+          # Hacer request con token
+          RESPONSE=$(curl -s -X POST \
+            "$ENDPOINT?token=${{ secrets.TRAIN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -w "\n%{http_code}")
+          
+          # Separar body y status code
+          HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+          
+          echo "📊 Status HTTP: $HTTP_STATUS"
+          echo "📄 Respuesta:"
+          echo "$HTTP_BODY" | jq '.' || echo "$HTTP_BODY"
+          
+          # Verificar éxito
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✅ Actualización completada exitosamente"
+            
+            # Extraer información relevante
+            STATUS=$(echo "$HTTP_BODY" | jq -r '.status // "unknown"')
+            
+            if [ "$STATUS" == "updated" ]; then
+              ACCURACY=$(echo "$HTTP_BODY" | jq -r '.train_result.accuracy // "N/A"')
+              echo "🎯 Modelo re-entrenado con accuracy: $ACCURACY"
+            elif [ "$STATUS" == "no_changes" ]; then
+              echo "ℹ️ No hay cambios en los datasets"
+            fi
+          else
+            echo "❌ Error en la actualización"
+            exit 1
+          fi
+      
+      - name: Send notification on failure
+        if: failure()
+        run: |
+          echo "⚠️ La actualización automática falló"
+          echo "Revisa los logs en: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
