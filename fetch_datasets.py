@@ -115,19 +115,29 @@ def _fetch_one(key: str, view_url: str) -> Dict:
     data = b""
     content_type = ""
 
-    # 1) nstedAPI
-    api_url = NSTED_API[key]
-    attempts.append(api_url)
-    try:
-        data, content_type = _download(api_url)
-        tmp = _read_csv_bytes_loose(data)
-        if _valid_shape(tmp) and _has_expected_cols(tmp, EXPECTED_COLS[key]):
-            df = tmp
-            parse_method = "nstedAPI"
-    except Exception:
-        df = None
+    # 1️⃣ nstedAPI (TOI puede tener nombre alternativo)
+    nsted_candidates = []
+    if key == "TOI":
+        nsted_candidates = [
+            "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
+            "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=poi_toi&select=*&format=csv",
+        ]
+    else:
+        nsted_candidates = [NSTED_API[key]]
 
-    # 2) TAP (si falló nstedAPI)
+    for api_url in nsted_candidates:
+        attempts.append(api_url)
+        try:
+            data, content_type = _download(api_url)
+            tmp = _read_csv_bytes_loose(data)
+            if _valid_shape(tmp) and _has_expected_cols(tmp, EXPECTED_COLS[key]):
+                df = tmp
+                parse_method = "nstedAPI"
+                break
+        except Exception:
+            continue
+
+    # 2️⃣ TAP (si nstedAPI falló)
     if df is None:
         api_url = TAP_API[key]
         attempts.append(api_url)
@@ -140,7 +150,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         except Exception:
             df = None
 
-    # 3) HTML (último recurso) – elegir tabla grande
+    # 3️⃣ HTML (último recurso)
     if df is None:
         attempts.append(view_url)
         try:
@@ -167,7 +177,14 @@ def _fetch_one(key: str, view_url: str) -> Dict:
             pass
 
     if df is None:
-        raise RuntimeError(f"No se pudo obtener un CSV válido para {key} (intentos={attempts}).")
+        # Si no se pudo obtener, devolvemos una advertencia pero no rompemos todo
+        return {
+            "df": pd.DataFrame(),
+            "data": b"",
+            "content_type": "",
+            "parse_method": "error",
+            "attempts": attempts + ["❌ No se obtuvo CSV válido"],
+        }
 
     return {
         "df": df,
