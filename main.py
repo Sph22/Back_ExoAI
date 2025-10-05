@@ -8,19 +8,23 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, ValidationError
 
-# ==== módulos locales ====
-import predict_model
+# ======= módulos locales =======
+# Asegúrate de tener estos archivos en el repo:
+# - fetch_datasets.py (con funciones fetch_all() y preview())
+# - predict_model.py  (con predict_one() y predict_batch())
+# - train_model.py    (con train())
 import fetch_datasets
+import predict_model
 import train_model
 
-app = FastAPI(title="ExoAI API")
+app = FastAPI(title="ExoAI API", version="1.0.0")
 
-# ---------- helper: JSON seguro (sin NaN/Inf) ----------
-def json_sanitize(obj: Any):
+# ---------- util: sanitizar NaN/Inf para JSON ----------
+def _js(obj: Any):
     if isinstance(obj, dict):
-        return {str(k): json_sanitize(v) for k, v in obj.items()}
+        return {str(k): _js(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [json_sanitize(v) for v in obj]
+        return [_js(v) for v in obj]
     if isinstance(obj, (np.generic,)):
         obj = obj.item()
     try:
@@ -48,18 +52,21 @@ class InputData(BaseModel):
     teff: float
     srad: float
 
-# ---------- rutas utilitarias ----------
+# ---------- rutas de info ----------
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version}
 
 @app.get("/routes")
-def list_routes():
-    """Lista todas las rutas cargadas para debugging."""
+def routes():
     r = []
-    for route in app.router.routes:
+    for rt in app.router.routes:
         try:
-            r.append({"path": route.path, "name": getattr(route, "name", None), "methods": list(route.methods or [])})
+            r.append({
+                "path": rt.path,
+                "name": getattr(rt, "name", None),
+                "methods": list(rt.methods or [])
+            })
         except Exception:
             pass
     return {"routes": r}
@@ -69,7 +76,7 @@ def list_routes():
 def predict_endpoint(payload: Union[InputData, List[InputData]]):
     try:
         if isinstance(payload, list):
-            data = [item.model_dump() for item in payload]
+            data = [p.model_dump() for p in payload]
             preds = predict_model.predict_batch(data)
             return {"predictions": preds}
         else:
@@ -83,63 +90,61 @@ def predict_endpoint(payload: Union[InputData, List[InputData]]):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# ---------- datasets: descarga + auto-retrain opcional ----------
+# ---------- datasets: descarga/actualización ----------
 @app.get("/datasets")
-def fetch_datasets_endpoint(
-    auto_retrain: bool = Query(False, description="Si hay cambios, entrena en background"),
-    token: str | None = Query(None, description="Token para autorizar auto_retrain")
-):
+def datasets(auto_retrain: bool = Query(False),
+             token: str | None = Query(None, description="protección para auto_retrain")):
     meta = fetch_datasets.fetch_all(auto_save=True)
 
+    # Autorización de retrain
     secret = os.getenv("TRAIN_TOKEN")
-    allow = True if not secret else (token == secret)
+    allowed = True if not secret else (token == secret)
 
-    if auto_retrain and meta.get("change_detected") and allow:
-        def _train():
+    if auto_retrain and meta.get("change_detected") and allowed:
+        from threading import Thread
+        def _bg():
             try:
                 train_model.train()
-            except Exception as ex:
-                print("Entrenamiento falló:", ex)
-        from threading import Thread
-        Thread(target=_train, daemon=True).start()
+            except Exception as e:
+                print("Entrenamiento falló:", e)
+        Thread(target=_bg, daemon=True).start()
         meta["retrain_started"] = True
     else:
         meta["retrain_started"] = False
 
-    return JSONResponse(json_sanitize(meta), status_code=200)
+    return JSONResponse(_js(meta), status_code=200)
 
-# ---------- preview seguro ----------
+# ---------- preview de CSVs guardados ----------
 @app.get("/datasets/preview")
-def preview_datasets_endpoint(n: int = Query(5, ge=1, le=50)):
+def datasets_preview(n: int = Query(5, ge=1, le=50)):
     try:
         data = fetch_datasets.preview(n=n)
-        return JSONResponse(json_sanitize(data), status_code=200)
+        return JSONResponse(_js(data), status_code=200)
     except Exception as e:
-        return JSONResponse(json_sanitize({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
+        return JSONResponse(_js({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
 
-# ---------- descarga de un CSV guardado ----------
+# ---------- descargar un CSV (último guardado) ----------
 @app.get("/datasets/download")
-def download_dataset(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
-    path = os.path.join(os.getenv("DATA_DIR", "data"), f"{name}.csv")
+def download(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
+    data_dir = os.getenv("DATA_DIR", "data")
+    path = os.path.join(data_dir, f"{name}.csv")
     if not os.path.exists(path):
-        return JSONResponse({"error": f"No existe {path}. Ejecuta /datasets antes."}, status_code=404)
+        return JSONResponse({"error": f"No existe {path}. Ejecuta /datasets primero."}, status_code=404)
     return FileResponse(path, filename=f"{name}.csv", media_type="text/csv")
 
 # ---------- entrenamiento manual ----------
 @app.post("/train")
-def train_endpoint(token: str = Query(None)):
+def train(token: str = Query(None)):
     secret = os.getenv("TRAIN_TOKEN")
-    allow = True if not secret else (token == secret)
-    if not allow:
+    if secret and token != secret:
         return JSONResponse({"error": "Token inválido"}, status_code=403)
     try:
-        result = train_model.train()
-        return JSONResponse(json_sanitize(result), status_code=200)
+        out = train_model.train()
+        return JSONResponse(_js(out), status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# ---------- ejecución local ----------
+# ---------- local ----------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
