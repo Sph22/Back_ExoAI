@@ -18,9 +18,14 @@ VIEW_URLS = {
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/TblView/nph-tblView?app=ExoTbls&config=k2pandc",
 }
 
-def _candidate_csv_url(view_url: str) -> str:
-    joiner = "&" if "?" in view_url else "?"
-    return f"{view_url}{joiner}output=csv"
+def _candidate_csv_urls(view_url: str) -> list[str]:
+    # Probamos varias variantes conocidas
+    base_has_q = "?" in view_url
+    joiner = "&" if base_has_q else "?"
+    return [
+        f"{view_url}{joiner}output=csv",
+        f"{view_url}{joiner}format=csv",
+    ]
 
 def _sha256_bytes(data: bytes) -> str:
     import hashlib
@@ -65,73 +70,104 @@ def _looks_like_csv(data: bytes, content_type: str) -> bool:
     """Heurística para decidir si los bytes representan CSV."""
     if "text/csv" in content_type or "application/csv" in content_type:
         return True
-    # Si empieza con '<' probablemente es HTML
     head = data[:200].lstrip()
     if head.startswith(b"<") or b"<html" in head.lower():
         return False
-    # Si tiene comas/line breaks típicos
-    # (muy laxa, solo como apoyo)
     return b"," in head and b"\n" in data[:1000]
 
 def _read_as_csv_bytes(data: bytes) -> pd.DataFrame:
     """Lee CSV de forma tolerante."""
     bio = io.BytesIO(data)
-    # comment='#' por headers descriptivos de NASA; engine='python' + on_bad_lines para robustez
     return pd.read_csv(bio, comment="#", engine="python", on_bad_lines="skip")
 
-def _read_as_html(url: str) -> pd.DataFrame:
-    """Parsea la primera tabla HTML encontrada."""
-    tables = pd.read_html(url)  # requiere lxml
+def _best_html_table(url: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Lee TODAS las tablas HTML y elige la mejor:
+    - mayor score = filas * columnas
+    - descarta tablas con <= 2 columnas
+    Devuelve (df, info) con métricas de selección.
+    """
+    # Intento 1: asumir encabezados en la primera fila
+    tables = pd.read_html(url, header=0)  # requiere lxml
     if not tables:
-        raise RuntimeError("No se encontraron tablas HTML en la página.")
-    return tables[0]
+        # Intento 2: sin header (pandas decide)
+        tables = pd.read_html(url)
+        if not tables:
+            raise RuntimeError("No se encontraron tablas HTML en la página.")
+
+    scored = []
+    for idx, t in enumerate(tables):
+        # Normaliza nombres a str
+        t.columns = [str(c) for c in t.columns]
+        n_rows, n_cols = t.shape
+        # descartamos tablas triviales
+        if n_cols <= 2:
+            continue
+        score = int(n_rows) * int(n_cols)
+        scored.append((score, idx, n_rows, n_cols, t))
+
+    if not scored:
+        # Si todas eran triviales, como último recurso usa la primera
+        t0 = tables[0]
+        t0.columns = [str(c) for c in t0.columns]
+        return t0, {"selected_index": 0, "selected_shape": t0.shape, "tables_found": len(tables)}
+
+    scored.sort(reverse=True)  # mejor score primero
+    best = scored[0]
+    _, idx, n_rows, n_cols, df = best
+    return df, {
+        "selected_index": idx,
+        "selected_shape": (int(n_rows), int(n_cols)),
+        "tables_found": len(tables),
+    }
 
 def fetch_all(auto_save: bool = True) -> Dict:
     """
-    Descarga los 3 datasets. Intenta CSV directo (output=csv);
-    si la respuesta no es CSV o falla el parser, hace fallback a parseo HTML.
+    Descarga los 3 datasets. Intenta CSV directo con varias variantes;
+    si la respuesta no es CSV o falla el parser, hace fallback a parseo HTML
+    escogiendo la tabla más grande (filas×columnas).
     Guarda:
       - data/<name>_YYYYMMDDThhmmssZ.csv
       - data/<name>.csv              (último)
       - data/manifest.json           (hash y metadata)
-    Devuelve metadata con filas/columnas y parse_method usado.
+    Devuelve metadata con filas/columnas, parse_method y tabla elegida.
     """
     manifest = _load_manifest()
     result = {"datasets": {}, "change_detected": False}
 
     for key, view_url in VIEW_URLS.items():
-        csv_url = _candidate_csv_url(view_url)
+        tried_csv_urls = _candidate_csv_urls(view_url)
 
-        # 1) Descargar intentando CSV
-        try:
-            data, ctype = _download(csv_url)
-        except Exception:
-            # Si la descarga falla, forzamos parseo HTML
-            data, ctype = b"", ""
-
-        parse_method = "csv"
+        data = b""
+        ctype = ""
+        chosen_csv_url = None
         df = None
+        parse_method = "csv"
 
-        # 2) Verificar si realmente es CSV; si no, intentar HTML
-        if not data or not _looks_like_csv(data, ctype):
+        # 1) Intentar CSV con varias rutas
+        for u in tried_csv_urls:
+            try:
+                _data, _ctype = _download(u)
+                if _looks_like_csv(_data, _ctype):
+                    # Validar que lo podamos leer
+                    tmp_df = _read_as_csv_bytes(_data)
+                    if tmp_df.shape[1] > 2 and tmp_df.shape[0] > 1:
+                        data, ctype, df, chosen_csv_url = _data, _ctype, tmp_df, u
+                        parse_method = "csv"
+                        break
+            except Exception:
+                continue  # probamos la siguiente
+
+        # 2) Fallback a HTML si no hubo CSV válido
+        html_select_info = {}
+        if df is None:
             parse_method = "html"
-            df = _read_as_html(view_url)
-            # Convertimos df a bytes CSV para guardar artefactos “latest”
+            df, html_select_info = _best_html_table(view_url)
             buf = io.StringIO()
             df.to_csv(buf, index=False)
             data = buf.getvalue().encode("utf-8")
-        else:
-            # Sí parece CSV → intentar leerlo con tolerancia; si falla, fallback a HTML
-            try:
-                df = _read_as_csv_bytes(data)
-            except Exception:
-                parse_method = "html"
-                df = _read_as_html(view_url)
-                buf = io.StringIO()
-                df.to_csv(buf, index=False)
-                data = buf.getvalue().encode("utf-8")
 
-        # 3) Guardar archivos y actualizar manifest
+        # 3) Guardar artefactos
         sha = _sha256_bytes(data)
         prev_sha = manifest["datasets"].get(key, {}).get("sha256")
 
@@ -145,9 +181,11 @@ def fetch_all(auto_save: bool = True) -> Dict:
             "latest_path": latest_path,
             "sha256": sha,
             "source_view": view_url,
-            "csv_attempt": csv_url,
+            "csv_attempts": tried_csv_urls,
+            "csv_used": chosen_csv_url,
             "content_type": ctype,
-            "parse_method": parse_method,  # <-- importante para depurar
+            "parse_method": parse_method,              # csv | html
+            "html_selection": html_select_info,        # índice/shape elegidos
             "updated_at_utc": datetime.utcnow().isoformat() + "Z",
             "changed": (prev_sha is None) or (prev_sha != sha),
         }
