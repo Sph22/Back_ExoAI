@@ -8,23 +8,26 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, ValidationError
 
-# ======= módulos locales =======
-# Asegúrate de tener estos archivos en el repo:
-# - fetch_datasets.py (con funciones fetch_all() y preview())
-# - predict_model.py  (con predict_one() y predict_batch())
-# - train_model.py    (con train())
+# ===== módulos locales =====
+# Debes tener estos archivos en la raíz del repo:
+#   - fetch_datasets.py  (funciones: fetch_all(), preview())
+#   - predict_model.py   (funciones: predict_one(), predict_batch())
+#   - train_model.py     (función: train())
 import fetch_datasets
 import predict_model
 import train_model
 
-app = FastAPI(title="ExoAI API", version="1.0.0")
+DATA_DIR = os.getenv("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+app = FastAPI(title="ExoAI API", version="1.0.1")
 
 # ---------- util: sanitizar NaN/Inf para JSON ----------
-def _js(obj: Any):
+def js(obj: Any):
     if isinstance(obj, dict):
-        return {str(k): _js(v) for k, v in obj.items()}
+        return {str(k): js(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_js(v) for v in obj]
+        return [js(v) for v in obj]
     if isinstance(obj, (np.generic,)):
         obj = obj.item()
     try:
@@ -52,24 +55,38 @@ class InputData(BaseModel):
     teff: float
     srad: float
 
-# ---------- rutas de info ----------
+# ---------- hooks de arranque ----------
+@app.on_event("startup")
+def on_startup():
+    # imprime rutas al arrancar (útil en Render Logs)
+    rutas = []
+    for rt in app.router.routes:
+        try:
+            rutas.append(rt.path)
+        except Exception:
+            pass
+    print("🤖 RUTAS CARGADAS:", rutas)
+    # asegura carpeta de datos
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+# ---------- info básica ----------
 @app.get("/")
 def root():
     return {"status": "ok", "version": app.version}
 
 @app.get("/routes")
-def routes():
-    r = []
+def list_routes():
+    info = []
     for rt in app.router.routes:
         try:
-            r.append({
+            info.append({
                 "path": rt.path,
                 "name": getattr(rt, "name", None),
                 "methods": list(rt.methods or [])
             })
         except Exception:
             pass
-    return {"routes": r}
+    return {"routes": info}
 
 # ---------- predicción ----------
 @app.post("/predict")
@@ -93,7 +110,7 @@ def predict_endpoint(payload: Union[InputData, List[InputData]]):
 # ---------- datasets: descarga/actualización ----------
 @app.get("/datasets")
 def datasets(auto_retrain: bool = Query(False),
-             token: str | None = Query(None, description="protección para auto_retrain")):
+             token: str | None = Query(None, description="token para autorizar auto_retrain")):
     meta = fetch_datasets.fetch_all(auto_save=True)
 
     # Autorización de retrain
@@ -112,22 +129,22 @@ def datasets(auto_retrain: bool = Query(False),
     else:
         meta["retrain_started"] = False
 
-    return JSONResponse(_js(meta), status_code=200)
+    return JSONResponse(js(meta), status_code=200)
 
 # ---------- preview de CSVs guardados ----------
 @app.get("/datasets/preview")
 def datasets_preview(n: int = Query(5, ge=1, le=50)):
     try:
         data = fetch_datasets.preview(n=n)
-        return JSONResponse(_js(data), status_code=200)
+        return JSONResponse(js(data), status_code=200)
     except Exception as e:
-        return JSONResponse(_js({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
+        # devolvemos 200 para que Postman no marque error mientras depuramos
+        return JSONResponse(js({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
 
-# ---------- descargar un CSV (último guardado) ----------
+# ---------- descargar un CSV ----------
 @app.get("/datasets/download")
 def download(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
-    data_dir = os.getenv("DATA_DIR", "data")
-    path = os.path.join(data_dir, f"{name}.csv")
+    path = os.path.join(DATA_DIR, f"{name}.csv")
     if not os.path.exists(path):
         return JSONResponse({"error": f"No existe {path}. Ejecuta /datasets primero."}, status_code=404)
     return FileResponse(path, filename=f"{name}.csv", media_type="text/csv")
@@ -140,7 +157,7 @@ def train(token: str = Query(None)):
         return JSONResponse({"error": "Token inválido"}, status_code=403)
     try:
         out = train_model.train()
-        return JSONResponse(_js(out), status_code=200)
+        return JSONResponse(js(out), status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
