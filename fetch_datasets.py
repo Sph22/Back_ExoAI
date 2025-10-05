@@ -92,6 +92,7 @@ def _download(url: str) -> Tuple[bytes, str]:
 
 
 def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
+    """Mismo lector que usamos tras descargar: engine='python', tolerante y sin low_memory."""
     bio = io.BytesIO(data)
     return pd.read_csv(
         bio,
@@ -247,101 +248,75 @@ def fetch_all(auto_save: bool = True) -> Dict:
     return result
 
 
-# ---------- PREVIEW ROBUSTO ----------
-def _read_csv_robust(path: str) -> Optional[pd.DataFrame]:
-    """Devuelve DataFrame o None; nunca levanta excepción hacia arriba."""
-    # 1) utf-8
+# ---------- PREVIEW ULTRA-ROBUSTO ----------
+def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
+    """
+    Reproduce la lectura que sí funcionó en la descarga: lee bytes y usa _read_csv_bytes_loose.
+    Si falla, intenta auto-detectar separador con sep=None y dtype=str.
+    """
     try:
-        return pd.read_csv(
-            path,
-            comment="#",
-            engine="python",
-            on_bad_lines="skip",
-        )
+        with open(path, "rb") as f:
+            data = f.read()
+        df = _read_csv_bytes_loose(data)  # mismo método que funcionó al descargar
+        if df is not None and df.shape[1] > 1:
+            return df
     except Exception:
         pass
-    # 2) latin-1
-    try:
-        return pd.read_csv(
-            path,
-            comment="#",
-            engine="python",
-            on_bad_lines="skip",
-            encoding="latin1",
-        )
-    except Exception:
-        return None
+
+    # Fallback: sep=None (autodetección) + dtype=str para evitar problemas de tipos
+    for enc in ("utf-8", "utf-8-sig", "latin1"):
+        try:
+            return pd.read_csv(
+                path,
+                comment="#",
+                engine="python",
+                sep=None,           # autodetecta delimitador
+                dtype=str,          # evita inferencia problemática
+                on_bad_lines="skip",
+                encoding=enc,
+            )
+        except Exception:
+            continue
+
+    return None
 
 
 def preview(n: int = 5) -> Dict:
-    """Devuelve las primeras n filas de cada dataset (intenta auto-detectar separador y codificación)."""
-    import csv
+    """Devuelve head(n) por dataset leyendo desde disco como si fuera la ruta de descarga (sin 500)."""
     out = {"datasets": {}}
-
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
         if not os.path.exists(latest_path):
             out["datasets"][key] = {"error": "No existe archivo latest. Ejecuta /datasets primero."}
             continue
 
-        try:
-            # Intentar leer el archivo probando codificación y separador
-            encodings = ["utf-8", "utf-8-sig", "latin1"]
-            seps = [",", ";", "\t"]
-            df = None
-
-            for enc in encodings:
-                for sep in seps:
-                    try:
-                        df = pd.read_csv(
-                            latest_path,
-                            comment="#",
-                            sep=sep,
-                            encoding=enc,
-                            engine="python",
-                            on_bad_lines="skip",
-                            low_memory=False
-                        )
-                        if df.shape[1] > 1:
-                            raise StopIteration  # lectura válida → salir de ambos bucles
-                    except StopIteration:
-                        break
-                    except Exception:
-                        continue
-                if df is not None and df.shape[1] > 1:
-                    break
-
-            if df is None or df.empty:
-                out["datasets"][key] = {
-                    "error": f"No se pudo leer {latest_path} tras probar múltiples separadores y encodings."
-                }
-                continue
-
-            # Convertir a tipos seguros para JSON
-            head_data = []
-            for _, row in df.head(n).iterrows():
-                safe_row = {}
-                for col, val in row.items():
-                    try:
-                        if isinstance(val, (float, int, str)) or val is None:
-                            safe_row[col] = val
-                        else:
-                            safe_row[col] = str(val)
-                    except Exception:
-                        safe_row[col] = None
-                head_data.append(safe_row)
-
+        df = _read_csv_from_path_like_download(latest_path)
+        if df is None:
             out["datasets"][key] = {
-                "rows": int(df.shape[0]),
-                "cols": int(df.shape[1]),
-                "columns": list(map(str, df.columns[:50])),
-                "head": head_data,
-                "latest_path": latest_path,
+                "error": f"No se pudo leer {latest_path} con los métodos de fallback."
             }
+            continue
 
-        except Exception as e:
-            out["datasets"][key] = {
-                "error": f"Excepción al procesar {latest_path}: {type(e).__name__}: {e}"
-            }
+        # Serialización segura
+        head_data = []
+        for _, row in df.head(n).iterrows():
+            safe_row = {}
+            for col, val in row.items():
+                try:
+                    if isinstance(val, (float, int, str)) or val is None:
+                        safe_row[col] = val
+                    else:
+                        safe_row[col] = str(val)
+                except Exception:
+                    safe_row[col] = None
+            head_data.append(safe_row)
+
+        out["datasets"][key] = {
+            "rows": int(df.shape[0]),
+            "cols": int(df.shape[1]),
+            "columns": list(map(str, df.columns[:50])),
+            "head": head_data,
+            "latest_path": latest_path,
+        }
 
     return out
