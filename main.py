@@ -8,13 +8,14 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, ValidationError
 
+# ==== módulos locales ====
 import predict_model
 import fetch_datasets
 import train_model
 
 app = FastAPI(title="ExoAI API")
 
-# ---------- JSON sanitize ----------
+# ---------- helper: JSON seguro (sin NaN/Inf) ----------
 def json_sanitize(obj: Any):
     if isinstance(obj, dict):
         return {str(k): json_sanitize(v) for k, v in obj.items()}
@@ -37,6 +38,7 @@ def json_sanitize(obj: Any):
         return None
     return str(obj)
 
+# ---------- modelos ----------
 class InputData(BaseModel):
     period: float
     duration: float
@@ -46,11 +48,23 @@ class InputData(BaseModel):
     teff: float
     srad: float
 
+# ---------- rutas utilitarias ----------
 @app.get("/")
 def root():
     return {"status": "ok"}
 
-# -------- Predicción --------
+@app.get("/routes")
+def list_routes():
+    """Lista todas las rutas cargadas para debugging."""
+    r = []
+    for route in app.router.routes:
+        try:
+            r.append({"path": route.path, "name": getattr(route, "name", None), "methods": list(route.methods or [])})
+        except Exception:
+            pass
+    return {"routes": r}
+
+# ---------- predicción ----------
 @app.post("/predict")
 def predict_endpoint(payload: Union[InputData, List[InputData]]):
     try:
@@ -69,11 +83,11 @@ def predict_endpoint(payload: Union[InputData, List[InputData]]):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# -------- Datasets + auto-retrain --------
+# ---------- datasets: descarga + auto-retrain opcional ----------
 @app.get("/datasets")
 def fetch_datasets_endpoint(
-    auto_retrain: bool = Query(False),
-    token: str | None = Query(None),
+    auto_retrain: bool = Query(False, description="Si hay cambios, entrena en background"),
+    token: str | None = Query(None, description="Token para autorizar auto_retrain")
 ):
     meta = fetch_datasets.fetch_all(auto_save=True)
 
@@ -94,7 +108,7 @@ def fetch_datasets_endpoint(
 
     return JSONResponse(json_sanitize(meta), status_code=200)
 
-# -------- Preview --------
+# ---------- preview seguro ----------
 @app.get("/datasets/preview")
 def preview_datasets_endpoint(n: int = Query(5, ge=1, le=50)):
     try:
@@ -103,7 +117,7 @@ def preview_datasets_endpoint(n: int = Query(5, ge=1, le=50)):
     except Exception as e:
         return JSONResponse(json_sanitize({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
 
-# -------- Descargar CSV guardado --------
+# ---------- descarga de un CSV guardado ----------
 @app.get("/datasets/download")
 def download_dataset(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
     path = os.path.join(os.getenv("DATA_DIR", "data"), f"{name}.csv")
@@ -111,7 +125,7 @@ def download_dataset(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$"
         return JSONResponse({"error": f"No existe {path}. Ejecuta /datasets antes."}, status_code=404)
     return FileResponse(path, filename=f"{name}.csv", media_type="text/csv")
 
-# -------- Entrenamiento manual --------
+# ---------- entrenamiento manual ----------
 @app.post("/train")
 def train_endpoint(token: str = Query(None)):
     secret = os.getenv("TRAIN_TOKEN")
@@ -124,7 +138,7 @@ def train_endpoint(token: str = Query(None)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# -------- Local --------
+# ---------- ejecución local ----------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
