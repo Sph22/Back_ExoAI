@@ -4,6 +4,8 @@ import os
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
 
+import math
+import numpy as np
 import pandas as pd
 import requests
 
@@ -33,18 +35,18 @@ TAP_API = {
     "k2pandc":    "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+*+from+k2pandc&format=csv",
 }
 
-# Columnas esperadas (para validar que sea la tabla correcta)
+# Columnas “señuelo” para validar
 EXPECTED_COLS: Dict[str, List[str]] = {
     "cumulative": ["koi_disposition", "koi_period", "koi_prad"],
     "TOI":        ["tfopwg_disp", "pl_orbper", "pl_rade"],
     "k2pandc":    ["disposition", "pl_orbper", "pl_rade"],
 }
 
-# ---------------- utilidades ----------------
 
 def _sha256_bytes(data: bytes) -> str:
     import hashlib
     return hashlib.sha256(data).hexdigest()
+
 
 def _save_bytes(name: str, data: bytes) -> Tuple[str, str]:
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -61,6 +63,7 @@ def _save_bytes(name: str, data: bytes) -> Tuple[str, str]:
         f.write(data)
     return path, latest
 
+
 def _load_manifest() -> Dict:
     manifest_path = os.path.join(DATA_DIR, "manifest.json")
     if os.path.exists(manifest_path):
@@ -68,10 +71,12 @@ def _load_manifest() -> Dict:
             return json.load(f)
     return {"datasets": {}}
 
+
 def _save_manifest(manifest: Dict) -> None:
     manifest_path = os.path.join(DATA_DIR, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+
 
 def _download(url: str) -> Tuple[bytes, str]:
     headers = {
@@ -87,8 +92,9 @@ def _download(url: str) -> Tuple[bytes, str]:
         raise ValueError("Respuesta vacía")
     return data, ctype
 
+
 def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
-    """Lector tolerante (mismo que usamos tras descargar); sin low_memory, engine python, saltando líneas malas."""
+    """Lector tolerante (engine='python', sin low_memory, saltando líneas malas)."""
     bio = io.BytesIO(data)
     return pd.read_csv(
         bio,
@@ -97,14 +103,15 @@ def _read_csv_bytes_loose(data: bytes) -> pd.DataFrame:
         on_bad_lines="skip",
     )
 
+
 def _valid_shape(df: pd.DataFrame) -> bool:
     return (df.shape[0] >= 5) and (df.shape[1] >= 5)
+
 
 def _has_expected_cols(df: pd.DataFrame, keys: List[str]) -> bool:
     cols = set(map(str, df.columns))
     return any(k in cols for k in keys)
 
-# ---------------- descarga ----------------
 
 def _fetch_one(key: str, view_url: str) -> Dict:
     attempts = []
@@ -113,7 +120,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
     data = b""
     content_type = ""
 
-    # 1) nstedAPI (TOI a veces alterna nombre)
+    # 1) nstedAPI (TOI puede alternar nombre)
     nsted_candidates = (
         [
             "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/nph-nstedAPI?table=toi&select=*&format=csv",
@@ -192,6 +199,7 @@ def _fetch_one(key: str, view_url: str) -> Dict:
         "saved": True,
     }
 
+
 def fetch_all(auto_save: bool = True) -> Dict:
     manifest = _load_manifest()
     result = {"datasets": {}, "change_detected": False}
@@ -241,15 +249,31 @@ def fetch_all(auto_save: bool = True) -> Dict:
 
     return result
 
-# --------------- PREVIEW ---------------
+
+# ---------- helpers JSON-safe ----------
+def _to_json_safe(v):
+    """Convierte cualquier escalar a un valor JSON-seguro (NaN/Inf -> None, numpy -> python)."""
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (np.generic,)):
+            v = v.item()
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                return None
+            return float(v)
+        # pandas NA / numpy nan
+        if isinstance(v, (str, int, bool)):
+            return v
+        if pd.isna(v):
+            return None
+    except Exception:
+        return None
+    return v if isinstance(v, (str, int, bool, float)) else str(v)
+
 
 def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
-    """
-    Reproduce la lectura que funcionó al descargar (bytes -> _read_csv_bytes_loose).
-    Si falla, intenta: sep=None (autodetección), dtype=str, varios encodings.
-    Nunca lanza excepción hacia arriba.
-    """
-    # 1) Igual que la lectura desde descarga (bytes)
+    """Reproduce lectura desde bytes; si falla, autodetecta separador/encoding."""
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -259,15 +283,14 @@ def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
     except Exception:
         pass
 
-    # 2) Fallbacks (autodetección de separador y encoding)
     for enc in ("utf-8", "utf-8-sig", "latin1"):
         try:
             df = pd.read_csv(
                 path,
                 comment="#",
                 engine="python",
-                sep=None,       # autodetecta delimitador
-                dtype=str,      # evita problemas de tipos
+                sep=None,       # autodetección
+                dtype=str,      # evita problemas de tipos/NaN como floats
                 on_bad_lines="skip",
                 encoding=enc,
             )
@@ -275,14 +298,11 @@ def _read_csv_from_path_like_download(path: str) -> Optional[pd.DataFrame]:
                 return df
         except Exception:
             continue
-
     return None
 
+
 def preview(n: int = 5) -> Dict:
-    """
-    Devuelve head(n) por dataset leyendo desde disco con estrategias robustas.
-    Nunca lanza excepción; en caso de fallo devuelve {"error": "..."} por dataset.
-    """
+    """Devuelve head(n) por dataset leyendo desde disco (sin NaN/Inf en el JSON)."""
     out = {"datasets": {}}
     for key in VIEW_URLS.keys():
         latest_path = os.path.join(DATA_DIR, f"{key}.csv")
@@ -297,26 +317,19 @@ def preview(n: int = 5) -> Dict:
             }
             continue
 
-        # Serialización segura (evita NaN/np types no JSON-serializables)
-        head_data = []
+        # Construir head JSON-seguro
+        head_rows: List[Dict] = []
         for _, row in df.head(n).iterrows():
             safe_row = {}
             for col, val in row.items():
-                try:
-                    if isinstance(val, (float, int, str)) or val is None:
-                        safe_row[col] = val
-                    else:
-                        safe_row[col] = str(val)
-                except Exception:
-                    safe_row[col] = None
-            head_data.append(safe_row)
+                safe_row[str(col)] = _to_json_safe(val)
+            head_rows.append(safe_row)
 
         out["datasets"][key] = {
             "rows": int(df.shape[0]),
             "cols": int(df.shape[1]),
-            "columns": list(map(str, df.columns[:50])),
-            "head": head_data,
+            "columns": [str(c) for c in df.columns[:50]],
+            "head": head_rows,
             "latest_path": latest_path,
         }
-
     return out

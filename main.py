@@ -1,6 +1,9 @@
 import os
-from typing import List, Union
+import math
+from typing import List, Union, Any
 
+import numpy as np
+import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, ValidationError
@@ -10,6 +13,32 @@ import fetch_datasets
 import train_model
 
 app = FastAPI(title="ExoAI API")
+
+# ---------- util JSON-safe (profundo) ----------
+def json_sanitize(obj: Any):
+    """Recorre dict/list/escalares y reemplaza NaN/Inf por None; convierte numpy->python."""
+    if isinstance(obj, dict):
+        return {str(k): json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_sanitize(v) for v in obj]
+    if isinstance(obj, (np.generic,)):
+        obj = obj.item()
+    try:
+        if obj is None:
+            return None
+        if isinstance(obj, float):
+            if not math.isfinite(obj):
+                return None
+            return float(obj)
+        if isinstance(obj, (int, str, bool)):
+            return obj
+        # pandas NA
+        if pd.isna(obj):
+            return None
+    except Exception:
+        return None
+    # fallback: str()
+    return str(obj)
 
 class InputData(BaseModel):
     period: float
@@ -60,23 +89,27 @@ def fetch_datasets_endpoint(
                 train_model.train()
             except Exception as ex:
                 print("Entrenamiento falló:", ex)
-        from threading import Thread
-        Thread(target=_train, daemon=True).start()
-        meta["retrain_started"] = True
+        try:
+            from threading import Thread
+            Thread(target=_train, daemon=True).start()
+            meta["retrain_started"] = True
+        except Exception as e:
+            meta["retrain_started"] = False
+            meta["retrain_error"] = str(e)
     else:
         meta["retrain_started"] = False
 
-    return JSONResponse(meta, status_code=200)
+    return JSONResponse(json_sanitize(meta), status_code=200)
 
-# -------- Preview seguro (sin 500) --------
+# -------- Preview seguro (sin 500 y sin NaN) --------
 @app.get("/datasets/preview")
 def preview_datasets_endpoint(n: int = Query(5, ge=1, le=50)):
     try:
         data = fetch_datasets.preview(n=n)
-        return JSONResponse(data, status_code=200)
+        return JSONResponse(json_sanitize(data), status_code=200)
     except Exception as e:
-        # Nunca 500: devolvemos el error como JSON 200 para depurar sin tumbar el servicio
-        return JSONResponse({"error": f"preview_failed: {type(e).__name__}: {e}"}, status_code=200)
+        # Nunca 500: JSON con el error (sanitizado)
+        return JSONResponse(json_sanitize({"error": f"preview_failed: {type(e).__name__}: {e}"}), status_code=200)
 
 # -------- Descarga de CSV guardado (para inspección) --------
 @app.get("/datasets/download")
