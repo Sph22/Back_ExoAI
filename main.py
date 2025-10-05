@@ -139,11 +139,24 @@ def list_routes():
 
 # ---------- predicción ----------
 @app.post("/predict", tags=["ML"])
-def predict_endpoint(payload: Union[InputData, List[InputData]]):
+async def predict_endpoint(payload: Union[InputData, List[InputData]]):
     """
     Predice si un objeto es un exoplaneta confirmado
     
     - **payload**: Datos del objeto (individual o lista)
+    
+    Ejemplo de payload:
+    ```json
+    {
+        "period": 3.52,
+        "duration": 2.8,
+        "depth": 4500,
+        "radius": 2.5,
+        "insolation": 150,
+        "teff": 5800,
+        "srad": 1.1
+    }
+    ```
     """
     try:
         if isinstance(payload, list):
@@ -163,6 +176,42 @@ def predict_endpoint(payload: Union[InputData, List[InputData]]):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/predict/test", tags=["ML"])
+async def predict_test():
+    """Endpoint de prueba para verificar que el modelo está cargado"""
+    try:
+        model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
+        if not os.path.exists(model_path):
+            return {
+                "status": "error",
+                "message": f"Modelo no encontrado en {model_path}",
+                "solution": "Ejecuta POST /train primero"
+            }
+        
+        # Hacer una predicción de prueba
+        test_data = {
+            "period": 3.52,
+            "duration": 2.8,
+            "depth": 4500.0,
+            "radius": 2.5,
+            "insolation": 150.0,
+            "teff": 5800.0,
+            "srad": 1.1
+        }
+        pred = predict_model.predict_one(test_data)
+        
+        return {
+            "status": "ok",
+            "model_loaded": True,
+            "test_prediction": pred,
+            "test_data": test_data
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 # ---------- datasets: descarga/actualización ----------
 @app.get("/datasets", tags=["Data"])
@@ -262,11 +311,13 @@ def download(name: str = Query(..., pattern="^(cumulative|TOI|k2pandc)$")):
 
 # ---------- entrenamiento manual ----------
 @app.post("/train", tags=["ML"])
-def train(token: str = Query(None, description="Token de autorización")):
+async def train_endpoint(token: str = Query(None, description="Token de autorización")):
     """
     Entrena el modelo de ML con los datos disponibles
     
     - **token**: Requerido si TRAIN_TOKEN está configurado como variable de entorno
+    
+    El entrenamiento puede tardar 1-2 minutos dependiendo del tamaño de los datos.
     """
     secret = os.getenv("TRAIN_TOKEN")
     if secret and token != secret:
@@ -291,6 +342,33 @@ def train(token: str = Query(None, description="Token de autorización")):
             status_code=500,
             detail=f"Error durante el entrenamiento: {str(e)}"
         )
+
+@app.get("/train/status", tags=["ML"])
+async def train_status():
+    """Verifica si hay datos disponibles para entrenar"""
+    cumulative_path = os.path.join(DATA_DIR, "cumulative.csv")
+    model_path = os.getenv("MODEL_PATH", "exoplanet_model.pkl")
+    
+    data_exists = os.path.exists(cumulative_path)
+    model_exists = os.path.exists(model_path)
+    
+    status = {
+        "data_available": data_exists,
+        "data_path": cumulative_path if data_exists else None,
+        "model_exists": model_exists,
+        "model_path": model_path if model_exists else None,
+        "ready_to_train": data_exists,
+        "can_predict": model_exists
+    }
+    
+    if not data_exists:
+        status["message"] = "Ejecuta GET /datasets para descargar los datos primero"
+    elif not model_exists:
+        status["message"] = "Datos disponibles. Ejecuta POST /train para entrenar el modelo"
+    else:
+        status["message"] = "Todo listo. Puedes hacer predicciones en POST /predict"
+    
+    return status
 
 # ---------- local ----------
 if __name__ == "__main__":
